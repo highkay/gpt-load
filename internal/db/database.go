@@ -57,7 +57,10 @@ func NewDB(configManager types.ConfigManager) (*gorm.DB, error) {
 		if err := os.MkdirAll(filepath.Dir(dsn), 0755); err != nil {
 			return nil, fmt.Errorf("failed to create database directory: %w", err)
 		}
-		dialector = sqlite.Open(dsn + "?_busy_timeout=5000")
+		// glebarez/sqlite(modernc) 的 DSN pragma 语法是 _pragma=<name>(<args>),多个用 & 连接。
+		// busy_timeout=5000: 写锁竞争时等待 5s 而非立即 SQLITE_BUSY(2026-08-24 22:41 写锁风暴根因);
+		// journal_mode=WAL + synchronous=NORMAL: 读写并发不再互斥,适配 WAL 崩溃容忍度。
+		dialector = sqlite.Open(dsn + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
 	}
 
 	var err error
@@ -74,8 +77,9 @@ func NewDB(configManager types.ConfigManager) (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to get sql.DB: %w", err)
 	}
 	// Set connection pool parameters for all drivers
-	sqlDB.SetMaxIdleConns(50)
-	sqlDB.SetMaxOpenConns(500)
+	// SQLite 单写者模型: 500 并发连接只会制造锁竞争(2026-08-24 写锁风暴帮凶),收窄到 20。
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetMaxOpenConns(20)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
 	return DB, nil

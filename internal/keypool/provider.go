@@ -295,7 +295,7 @@ func (p *KeyProvider) handleFailure(apiKey *models.APIKey, group *models.Group, 
 	// 获取该分组的有效配置
 	blacklistThreshold := group.EffectiveConfig.BlacklistThreshold
 
-	return p.executeTransactionWithRetry(func(tx *gorm.DB) error {
+	err = p.executeTransactionWithRetry(func(tx *gorm.DB) error {
 		var key models.APIKey
 		if err := tx.Set("gorm:query_option", "FOR UPDATE").First(&key, apiKey.ID).Error; err != nil {
 			return fmt.Errorf("failed to lock key %d for update: %w", apiKey.ID, err)
@@ -329,6 +329,12 @@ func (p *KeyProvider) handleFailure(apiKey *models.APIKey, group *models.Group, 
 
 		return nil
 	})
+	if err != nil {
+		// 高写入竞争(SQLITE_BUSY/SQLITE_TOOBUSY)时,失败记账降级为非致命:
+		// 只记录警告并继续,绝不能把整个用户请求 500 掉(2026-08-24 22:41 写锁风暴放大器根因)。
+		logrus.WithFields(logrus.Fields{"keyID": apiKey.ID}).Warnf("skip failure stat update (best-effort): %v", err)
+	}
+	return nil
 }
 
 // LoadKeysFromDB 从数据库加载所有分组和密钥，并填充到 Store 中。
