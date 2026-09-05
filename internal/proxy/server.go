@@ -254,6 +254,15 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		errorMessage = utils.RedactSecret(errorMessage, apiKey.KeyValue)
 		parsedError = utils.RedactSecret(parsedError, apiKey.KeyValue)
 
+		// 终态失败(如内容审核):错误由请求内容决定、与 key/模型无关,
+		// 换 key 重试必然得到相同错误,只会给每把健康 key 都计一次失败。
+		// 直接作为 final 透传:不重试、不计失败、不触发学习。
+		if app_errors.IsTerminalUpstreamError(parsedError) {
+			ps.logRequest(c, originalGroup, group, apiKey, startTime, statusCode, errors.New(parsedError), isStream, upstreamURL, channelHandler, bodyBytes, models.RequestTypeFinal)
+			writeUpstreamErrorResponse(c, statusCode, errorMessage)
+			return
+		}
+
 		// 使用解析后的错误信息更新密钥状态
 		ps.keyProvider.UpdateStatus(apiKey, group, false, parsedError)
 
@@ -275,12 +284,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 
 		// 如果是最后一次尝试，直接返回错误，不再递归
 		if isLastAttempt {
-			var errorJSON map[string]any
-			if err := json.Unmarshal([]byte(errorMessage), &errorJSON); err == nil {
-				c.JSON(statusCode, errorJSON)
-			} else {
-				response.Error(c, app_errors.NewAPIErrorWithUpstream(statusCode, "UPSTREAM_ERROR", errorMessage))
-			}
+			writeUpstreamErrorResponse(c, statusCode, errorMessage)
 			return
 		}
 
@@ -338,6 +342,17 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	}
 
 	ps.logRequest(c, originalGroup, group, apiKey, startTime, resp.StatusCode, passthroughErr, isStream, upstreamURL, channelHandler, bodyBytes, models.RequestTypeFinal)
+}
+
+// writeUpstreamErrorResponse 将上游错误作为最终响应返回:
+// 优先透传上游 JSON 错误体,无法解析时包装为 UPSTREAM_ERROR。
+func writeUpstreamErrorResponse(c *gin.Context, statusCode int, errorMessage string) {
+	var errorJSON map[string]any
+	if err := json.Unmarshal([]byte(errorMessage), &errorJSON); err == nil {
+		c.JSON(statusCode, errorJSON)
+		return
+	}
+	response.Error(c, app_errors.NewAPIErrorWithUpstream(statusCode, "UPSTREAM_ERROR", errorMessage))
 }
 
 func shouldFailoverOnStatusCode(statusCode int, group *models.Group) bool {

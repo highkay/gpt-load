@@ -216,16 +216,29 @@ func TestSelectKeyForGroupModelLearns(t *testing.T) {
 }
 
 func TestIsModelAccessDeniedError(t *testing.T) {
-	if !IsModelAccessDeniedError("Model access denied.") {
-		t.Fatal("should match Model access denied")
+	cases := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"dashscope-intl 403", "Model access denied.", true},
+		{"literal variant", "<403> Access to model denied. Please make sure you are eligible for using the model.", true},
+		{
+			"dashscope domestic 400",
+			"Access denied, please make sure your account has access to this model. For details, see: https://help.aliyun.com/",
+			true,
+		},
+		{"domestic case-insensitive", "Access Denied, please make sure your account HAS ACCESS TO THIS MODEL.", true},
+		// 回归护栏:审查/欠费/配额等非"模型权限"错误绝不能被学习层吞掉
+		{"content moderation", "InternalError.Algo.DataInspectionFailed: Input text data may contain inappropriate content.", false},
+		{"arrearage", "Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/", false},
+		{"IP restriction", "IP access denied by API-Key restriction.", false},
+		{"quota", "You exceeded your current quota", false},
+		{"empty", "", false},
 	}
-	if !IsModelAccessDeniedError("<403> Access to model denied. Please make sure you are eligible for using the model.") {
-		t.Fatal("should match Access to model denied")
-	}
-	if IsModelAccessDeniedError("IP access denied by API-Key restriction.") {
-		t.Fatal("must not match IP restriction")
-	}
-	if IsModelAccessDeniedError("You exceeded your current quota") {
-		t.Fatal("must not match quota errors")
+	for _, tc := range cases {
+		if got := IsModelAccessDeniedError(tc.msg); got != tc.want {
+			t.Errorf("%s: IsModelAccessDeniedError(%q) = %v, want %v", tc.name, tc.msg, got, tc.want)
+		}
 	}
 }

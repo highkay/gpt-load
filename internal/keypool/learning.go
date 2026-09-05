@@ -143,7 +143,10 @@ func IsModelAccessDeniedError(msg string) bool {
 	}
 	lower := strings.ToLower(msg)
 	return strings.Contains(lower, "model access denied") ||
-		strings.Contains(lower, "access to model denied")
+		strings.Contains(lower, "access to model denied") ||
+		// dashscope 国内端点真实 400 措辞:
+		// "Access denied, please make sure your account has access to this model."
+		strings.Contains(lower, "make sure your account has access to this model")
 }
 
 // setExcluded 测试辅助:直接设置排除状态
