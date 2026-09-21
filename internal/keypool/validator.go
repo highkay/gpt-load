@@ -69,7 +69,9 @@ func (s *KeyValidator) ValidateSingleKey(key *models.APIKey, group *models.Group
 	if !isValid && validationErr != nil {
 		errorMsg = validationErr.Error()
 	}
-	s.keypoolProvider.UpdateStatus(key, group, isValid, errorMsg)
+	// 校验路径拿不到独立的状态码,但它嵌在错误文本里("[status NNN] ..."),
+	// 由 IsKeyFatalUpstreamError 自行解析。
+	s.keypoolProvider.UpdateStatus(key, group, isValid, 0, errorMsg)
 
 	if !isValid {
 		logrus.WithFields(logrus.Fields{

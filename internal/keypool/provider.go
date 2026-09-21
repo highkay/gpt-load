@@ -183,7 +183,7 @@ func (p *KeyProvider) apiKeyFromStore(keyIDStr string, groupID uint) (*models.AP
 }
 
 // UpdateStatus 异步地提交一个 Key 状态更新任务。
-func (p *KeyProvider) UpdateStatus(apiKey *models.APIKey, group *models.Group, isSuccess bool, errorMessage string) {
+func (p *KeyProvider) UpdateStatus(apiKey *models.APIKey, group *models.Group, isSuccess bool, statusCode int, errorMessage string) {
 	go func() {
 		keyHashKey := fmt.Sprintf("key:%d", apiKey.ID)
 		activeKeysListKey := fmt.Sprintf("group:%d:active_keys", group.ID)
@@ -199,7 +199,7 @@ func (p *KeyProvider) UpdateStatus(apiKey *models.APIKey, group *models.Group, i
 					"error": errorMessage,
 				}).Debug("Uncounted error, skipping failure handling")
 			} else {
-				if err := p.handleFailure(apiKey, group, keyHashKey, activeKeysListKey); err != nil {
+				if err := p.handleFailure(apiKey, group, keyHashKey, activeKeysListKey, statusCode, errorMessage); err != nil {
 					logrus.WithFields(logrus.Fields{"keyID": apiKey.ID, "error": err}).Error("Failed to handle key failure")
 				}
 			}
@@ -280,7 +280,7 @@ func (p *KeyProvider) handleSuccess(keyID uint, keyHashKey, activeKeysListKey st
 	})
 }
 
-func (p *KeyProvider) handleFailure(apiKey *models.APIKey, group *models.Group, keyHashKey, activeKeysListKey string) error {
+func (p *KeyProvider) handleFailure(apiKey *models.APIKey, group *models.Group, keyHashKey, activeKeysListKey string, statusCode int, errorMessage string) error {
 	keyDetails, err := p.store.HGetAll(keyHashKey)
 	if err != nil {
 		return fmt.Errorf("failed to get key details from store: %w", err)
@@ -300,6 +300,13 @@ func (p *KeyProvider) handleFailure(apiKey *models.APIKey, group *models.Group, 
 
 	blacklistThreshold := group.EffectiveConfig.BlacklistThreshold
 	shouldBlacklist := blacklistThreshold > 0 && newFailureCount >= int64(blacklistThreshold)
+
+	// 凭证失效/账号欠费类致命错误:与请求内容无关,换 key 重试依然有意义,
+	// 但这把 key 自己已经彻底不能用了——不等 failure_count 撞阈值,立刻出池
+	// (否则它会一直留在 active 列表里被轮询,表现为"key 很多但一用就报错")。
+	keyFatal := app_errors.IsKeyFatalUpstreamError(statusCode, errorMessage)
+	shouldDisable := shouldBlacklist || keyFatal
+
 	updates := map[string]any{
 		"failure_count": gorm.Expr(
 			"CASE WHEN failure_count < ? THEN ? ELSE failure_count END",
@@ -307,7 +314,7 @@ func (p *KeyProvider) handleFailure(apiKey *models.APIKey, group *models.Group, 
 			newFailureCount,
 		),
 	}
-	if shouldBlacklist {
+	if shouldDisable {
 		updates["status"] = models.KeyStatusInvalid
 	}
 
@@ -329,8 +336,12 @@ func (p *KeyProvider) handleFailure(apiKey *models.APIKey, group *models.Group, 
 			}
 		}
 
-		if shouldBlacklist {
-			logrus.WithFields(logrus.Fields{"keyID": apiKey.ID, "threshold": blacklistThreshold}).Warn("Key has reached blacklist threshold, disabling.")
+		if shouldDisable {
+			if keyFatal {
+				logrus.WithFields(logrus.Fields{"keyID": apiKey.ID, "status": statusCode, "error": errorMessage}).Warn("Key reported a fatal upstream error (dead credential or exhausted balance), disabling immediately.")
+			} else {
+				logrus.WithFields(logrus.Fields{"keyID": apiKey.ID, "threshold": blacklistThreshold}).Warn("Key has reached blacklist threshold, disabling.")
+			}
 			if err := p.store.LRem(activeKeysListKey, 0, apiKey.ID); err != nil {
 				return fmt.Errorf("failed to LRem key from active list: %w", err)
 			}

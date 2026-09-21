@@ -263,8 +263,8 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			return
 		}
 
-		// 使用解析后的错误信息更新密钥状态
-		ps.keyProvider.UpdateStatus(apiKey, group, false, parsedError)
+		// 使用解析后的错误信息更新密钥状态(带状态码:401 凭证失效/402 欠费可立即出池)
+		ps.keyProvider.UpdateStatus(apiKey, group, false, statusCode, parsedError)
 
 		// 自动学习:上游明确"模型权限拒绝" → 记录连续拒绝、指数退避排除
 		if keypool.IsModelAccessDeniedError(parsedError) {
