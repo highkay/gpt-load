@@ -1,6 +1,7 @@
 services:
   gpt-load:
-    image: ghcr.1ms.run/tbphp/gpt-load:latest
+    image: ghcr.1ms.run/tbphp/gpt-load:1
+    # 上游自 2026-09 起 v1 通道固定为 :1 标签(latest 让位 v2)
     # build:
     #   context: .
     #   dockerfile: Dockerfile
