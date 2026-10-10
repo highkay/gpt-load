@@ -183,13 +183,17 @@ func (p *KeyProvider) apiKeyFromStore(keyIDStr string, groupID uint) (*models.AP
 }
 
 // UpdateStatus 异步地提交一个 Key 状态更新任务。
-func (p *KeyProvider) UpdateStatus(apiKey *models.APIKey, group *models.Group, isSuccess bool, statusCode int, errorMessage string) {
+// allowRevive 仅在 isSuccess=true 时有意义:true 允许把非 active 的 key 复活为 active
+// ——这是**校验路径专用**(invalid key 的唯一自愈入口,见 validator/CronChecker);
+// 流量路径必须传 false:并发请求中"刚被判出池的 key 还有在途成功"会把死 key 拉回池子,
+// 即 2026-09-26 移除的"拉黑→复活"循环的并发变体。
+func (p *KeyProvider) UpdateStatus(apiKey *models.APIKey, group *models.Group, isSuccess bool, statusCode int, errorMessage string, allowRevive bool) {
 	go func() {
 		keyHashKey := fmt.Sprintf("key:%d", apiKey.ID)
 		activeKeysListKey := fmt.Sprintf("group:%d:active_keys", group.ID)
 
 		if isSuccess {
-			if err := p.handleSuccess(apiKey.ID, keyHashKey, activeKeysListKey); err != nil {
+			if err := p.handleSuccess(apiKey.ID, keyHashKey, activeKeysListKey, allowRevive); err != nil {
 				logrus.WithFields(logrus.Fields{"keyID": apiKey.ID, "error": err}).Error("Failed to handle key success")
 			}
 		} else {
@@ -234,7 +238,11 @@ func (p *KeyProvider) executeTransactionWithRetry(operation func(tx *gorm.DB) er
 	return err
 }
 
-func (p *KeyProvider) handleSuccess(keyID uint, keyHashKey, activeKeysListKey string) error {
+// handleSuccess 在成功时:重置 failure_count,并按 allowRevive 决定是否复活非 active key。
+// allowRevive=false(流量路径)时,对非 active key 直接返回——fc 归零只作用于 active key,
+// 复活只属于校验路径。旧的盲恢复逻辑(每 5 分钟无条件复活全部 invalid)已在 2026-09-26 移除;
+// 并发"出池瞬间到达的成功"是本条的流量侧变体,同样不允许。
+func (p *KeyProvider) handleSuccess(keyID uint, keyHashKey, activeKeysListKey string, allowRevive bool) error {
 	keyDetails, err := p.store.HGetAll(keyHashKey)
 	if err != nil {
 		return fmt.Errorf("failed to get key details from store: %w", err)
@@ -244,6 +252,10 @@ func (p *KeyProvider) handleSuccess(keyID uint, keyHashKey, activeKeysListKey st
 	isActive := keyDetails["status"] == models.KeyStatusActive
 
 	if failureCount == 0 && isActive {
+		return nil
+	}
+	if !isActive && !allowRevive {
+		// 流量路径不复活已出池的 key:在途成功不能覆盖"刚被判定出池"的结论
 		return nil
 	}
 

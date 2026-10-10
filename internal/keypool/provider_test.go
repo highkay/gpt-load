@@ -2,6 +2,8 @@ package keypool
 
 import (
 	"errors"
+	"fmt"
+	"strconv"
 	"gpt-load/internal/encryption"
 	"gpt-load/internal/models"
 	"gpt-load/internal/store"
@@ -245,5 +247,76 @@ func TestIsModelAccessDeniedError(t *testing.T) {
 		if got := IsModelAccessDeniedError(tc.msg); got != tc.want {
 			t.Errorf("%s: IsModelAccessDeniedError(%q) = %v, want %v", tc.name, tc.msg, got, tc.want)
 		}
+	}
+}
+
+// 复活门控:流量路径(allowRevive=false)的成功不得复活已出池的 key(fc 也不动);
+// 校验路径(allowRevive=true)才允许 invalid→active 并归零 fc。
+// 背景:流量成功路径恢复 fc 归零(2026-10-10)后,若不设门,在途成功会与
+// 并发的 key-fatal 出池竞争,把刚出池的死 key 拉回池——即已移除的"拉黑→复活"循环变体。
+func TestHandleSuccessReviveGate(t *testing.T) {
+	p := newTestProvider(t)
+
+	var key models.APIKey
+	if err := p.db.Where("group_id = ? AND key_value = ?", 1, "sk-unrestricted").First(&key).Error; err != nil {
+		t.Fatalf("fetch key: %v", err)
+	}
+	keyIDStr := fmt.Sprintf("%d", key.ID)
+	keyHashKey := fmt.Sprintf("key:%d", key.ID)
+	activeList := "group:1:active_keys"
+
+	park := func() {
+		if err := p.db.Model(&key).Updates(map[string]any{"status": "invalid", "failure_count": 5}).Error; err != nil {
+			t.Fatalf("park db: %v", err)
+		}
+		if err := p.store.HSet(keyHashKey, map[string]any{"status": "invalid", "failure_count": 5}); err != nil {
+			t.Fatalf("park store: %v", err)
+		}
+		if err := p.store.LRem(activeList, 0, keyIDStr); err != nil {
+			t.Fatalf("park list: %v", err)
+		}
+	}
+	state := func() (string, int64) {
+		d, err := p.store.HGetAll(keyHashKey)
+		if err != nil {
+			t.Fatalf("state: %v", err)
+		}
+		fc, _ := strconv.ParseInt(d["failure_count"], 10, 64)
+		return d["status"], fc
+	}
+	inActiveList := func() bool {
+		ids, err := p.store.LRange(activeList, 0, -1)
+		if err != nil {
+			return false
+		}
+		for _, id := range ids {
+			if id == keyIDStr {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 流量路径:出池 key 的在途成功 → 不复活、fc 不动、不回候选列表
+	park()
+	if err := p.handleSuccess(key.ID, keyHashKey, activeList, false); err != nil {
+		t.Fatalf("traffic success: %v", err)
+	}
+	if st, fc := state(); st != models.KeyStatusInvalid || fc != 5 {
+		t.Fatalf("traffic success must not touch parked key, got status=%s fc=%d", st, fc)
+	}
+	if inActiveList() {
+		t.Fatal("parked key must not be re-added to active list by traffic success")
+	}
+
+	// 校验路径:允许复活 + fc 归零 + 回候选列表
+	if err := p.handleSuccess(key.ID, keyHashKey, activeList, true); err != nil {
+		t.Fatalf("validation success: %v", err)
+	}
+	if st, fc := state(); st != models.KeyStatusActive || fc != 0 {
+		t.Fatalf("validation success must revive and reset fc, got status=%s fc=%d", st, fc)
+	}
+	if !inActiveList() {
+		t.Fatal("revived key must be back in active list")
 	}
 }

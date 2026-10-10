@@ -267,7 +267,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		// 模型权限拒绝类错误(IsUnCounted)在此跳过 failure_count——它不是 key 健康信号,
 		// 由下面的学习层按 (key,model) 定向排除。同一豁免同时覆盖校验路径(validator 也走
 		// UpdateStatus),避免两处分类分叉。
-		ps.keyProvider.UpdateStatus(apiKey, group, false, statusCode, parsedError)
+		ps.keyProvider.UpdateStatus(apiKey, group, false, statusCode, parsedError, false)
 
 		// 自动学习:上游明确"模型权限拒绝" → 记录连续拒绝、指数退避排除
 		if keypool.IsModelAccessDeniedError(parsedError) {
@@ -301,7 +301,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	// handleSuccess 对 fc=0 的 active key 只做一次 HGetAll 即返回,仅 fc>0 时有写入,
 	// 相对 SelectKeyForGroupModel 每请求的逐 key HGetAll 可忽略。
 	if resp.StatusCode < 400 {
-		ps.keyProvider.UpdateStatus(apiKey, group, true, 0, "")
+		ps.keyProvider.UpdateStatus(apiKey, group, true, 0, "", false) // allowRevive=false:流量成功只归零 fc,绝不复活已出池的 key
 	}
 	logrus.Debugf("Request for group %s succeeded on attempt %d with key %s", group.Name, retryCount+1, utils.MaskAPIKey(apiKey.KeyValue))
 

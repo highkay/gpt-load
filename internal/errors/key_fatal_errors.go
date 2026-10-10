@@ -31,15 +31,23 @@ var authSubstrings = []string{
 	"authentication_error",
 }
 
-// keyRestrictionSubstrings key/账号级不可用的 403 措辞(仅 403 放行):
-//   - 阿里云百炼给 key 配了 IP 白名单,本机出口永远用不了;
-//   - 账号级未购买/无资格(2026-10-10 qwensg key 881 实测: ALL 模型含 qwen-plus
-//     均 403 "Access to model denied. Please make sure you are eligible for using the model.",
-//     与既有 402 欠费同类——账号没用,立即出池,缴费/开通后由小时级校验自愈)。
+// keyRestrictionSubstrings key 级不可用的 403 措辞(仅 403 放行):
+// 如阿里云百炼给 key 配了 IP 白名单,本机出口永远用不了。
 // 注意 403 的"模型权限拒绝"(Model access denied / 账户对该模型无权限)不在此列——
-// 那是 (key,model) 维度,归学习层 + IsUnCounted(不计 failure_count)。
+// 那是 (key,model) 维度,归学习层 + IsUnCounted(不计 failure_count);账号级资格问题
+// 见 accountEligibilitySubstrings。
 var keyRestrictionSubstrings = []string{
 	"ip access denied by api-key restriction",
+}
+
+// accountEligibilitySubstrings 账号级资格/购买状态的 403 措辞(仅 403 放行):
+// "Access to model denied. Please make sure you are eligible for using the model."
+// (dashscope AccessDenied.Unpurchased)。作用:该账号无可用模型 → 与 402 欠费同类,
+// 立即 invalid 出池,缴费/开通后由小时级校验(CronChecker)自愈。
+// 【推断项】2026-10-10 治理时仅单一账号(key 881,全 24 模型含 qwen-plus 均命中)观测到,
+// 7 天 request_logs 零命中;若未来出现"仅个别模型 Unpurchased 但账号其他模型可用"的反例,
+// 应将其降级为 (key,model) 维度(移入 uncounted + 学习层)。
+var accountEligibilitySubstrings = []string{
 	"access to model denied",
 	"eligible for using the model",
 }
@@ -80,7 +88,8 @@ func IsKeyFatalUpstreamError(statusCode int, errorMsg string) bool {
 	case 402:
 		return containsAny(errorLower, balanceSubstrings)
 	case 403:
-		return containsAny(errorLower, keyRestrictionSubstrings)
+		return containsAny(errorLower, keyRestrictionSubstrings) ||
+			containsAny(errorLower, accountEligibilitySubstrings)
 	}
 
 	return false
