@@ -263,18 +263,17 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			return
 		}
 
-		// 模型权限拒绝是 (key, model) 维度的能力信号,不是 key 健康信号:
-		// 交由学习层定向排除(strikes → 指数退避),不计 failure_count——
-		// 否则一把能正常服务其他模型的健康 key,会被"该模型不被上游放行"的
-		// 403 一路攒到 blacklist_threshold 误判出池(2026-09-26 qwenchina
-		// key 2426 实测:558 次 qwen3.8-flash 成功,被其他模型的 403 攒到 fc=30)。
+		// 使用解析后的错误信息更新密钥状态(带状态码:401 凭证失效/402 欠费/账号未购买可立即出池)。
+		// 模型权限拒绝类错误(IsUnCounted)在此跳过 failure_count——它不是 key 健康信号,
+		// 由下面的学习层按 (key,model) 定向排除。同一豁免同时覆盖校验路径(validator 也走
+		// UpdateStatus),避免两处分类分叉。
+		ps.keyProvider.UpdateStatus(apiKey, group, false, statusCode, parsedError)
+
+		// 自动学习:上游明确"模型权限拒绝" → 记录连续拒绝、指数退避排除
 		if keypool.IsModelAccessDeniedError(parsedError) {
 			ps.keyProvider.RecordModelDenied(group.ID, apiKey.ID, model)
 			logrus.Infof("Learned: key %d cannot serve model '%s' (group %s, strikes=%d)",
 				apiKey.ID, model, group.Name, ps.keyProvider.StrikesOf(group.ID, apiKey.ID, model))
-		} else {
-			// 使用解析后的错误信息更新密钥状态(带状态码:401 凭证失效/402 欠费可立即出池)
-			ps.keyProvider.UpdateStatus(apiKey, group, false, statusCode, parsedError)
 		}
 
 		// 判断是否为最后一次尝试
@@ -296,7 +295,14 @@ func (ps *ProxyServer) executeRequestWithRetry(
 		return
 	}
 
-	// ps.keyProvider.UpdateStatus(apiKey, group, true) // 请求成功不再重置成功次数，减少IO消耗
+	// 成功即归零 failure_count。2026-10-10 修复:原为注释状态("减少IO消耗"),
+	// 但 failure_count 从不衰减 ⇒ 任何 key 迟早单调撞 blacklist_threshold 被误判出池
+	// (现网证据: g8 881/1920 fc=30 出池、g7 2507 fc=29 濒临出池,均伴随大量成功服务)。
+	// handleSuccess 对 fc=0 的 active key 只做一次 HGetAll 即返回,仅 fc>0 时有写入,
+	// 相对 SelectKeyForGroupModel 每请求的逐 key HGetAll 可忽略。
+	if resp.StatusCode < 400 {
+		ps.keyProvider.UpdateStatus(apiKey, group, true, 0, "")
+	}
 	logrus.Debugf("Request for group %s succeeded on attempt %d with key %s", group.Name, retryCount+1, utils.MaskAPIKey(apiKey.KeyValue))
 
 	// 自动学习:成功服务为该 (key, model) 加分（若此前被误排除可恢复）

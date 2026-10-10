@@ -16,6 +16,7 @@ func TestIsKeyFatalUpstreamError(t *testing.T) {
 		{"deepseek 402 insufficient balance", 402, "Insufficient Balance", true},
 		{"openai 402 quota", 402, "You exceeded your current quota, please check your plan and billing details.", true},
 		{"dashscope 403 ip restriction", 403, "IP access denied by API-Key restriction.", true},
+		{"dashscope 403 unpurchased account", 403, "Access to model denied. Please make sure you are eligible for using the model.", true},
 		// 校验路径:状态码嵌在错误文本里
 		{"validation 401 text", 0, "[status 401] Authentication Fails, Your api key: **** is invalid", true},
 		{"validation 401 no status prefix", 0, "Incorrect API key provided", true},

@@ -140,14 +140,14 @@ func (l *modelLearner) strikesOf(groupID, keyID uint, model string) int {
 }
 
 // IsModelAccessDeniedError 判断上游错误是否属于"该 key 无此模型权限"类。
-// 只匹配模型权限拒绝,不匹配 IP 白名单、配额、参数等其他 403。
+// 只匹配 (key, model) 维度的模型权限拒绝,不匹配 IP 白名单、配额、账号欠费/未购买、
+// 参数等其他 4xx——那些不属于学习层职责(账号级由 key_fatal_errors 立即出池)。
 func IsModelAccessDeniedError(msg string) bool {
 	if msg == "" {
 		return false
 	}
 	lower := strings.ToLower(msg)
 	return strings.Contains(lower, "model access denied") ||
-		strings.Contains(lower, "access to model denied") ||
 		// dashscope 国内端点真实 400 措辞:
 		// "Access denied, please make sure your account has access to this model."
 		strings.Contains(lower, "make sure your account has access to this model")

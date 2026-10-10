@@ -31,10 +31,17 @@ var authSubstrings = []string{
 	"authentication_error",
 }
 
-// keyRestrictionSubstrings key 自身被限制(仅 403 放行):如阿里云百炼给 key 配了 IP 白名单,
-// 本机出口永远用不了。注意 403 的"模型权限拒绝"(Model access denied)不在此列——那由学习层处理。
+// keyRestrictionSubstrings key/账号级不可用的 403 措辞(仅 403 放行):
+//   - 阿里云百炼给 key 配了 IP 白名单,本机出口永远用不了;
+//   - 账号级未购买/无资格(2026-10-10 qwensg key 881 实测: ALL 模型含 qwen-plus
+//     均 403 "Access to model denied. Please make sure you are eligible for using the model.",
+//     与既有 402 欠费同类——账号没用,立即出池,缴费/开通后由小时级校验自愈)。
+// 注意 403 的"模型权限拒绝"(Model access denied / 账户对该模型无权限)不在此列——
+// 那是 (key,model) 维度,归学习层 + IsUnCounted(不计 failure_count)。
 var keyRestrictionSubstrings = []string{
 	"ip access denied by api-key restriction",
+	"access to model denied",
+	"eligible for using the model",
 }
 
 // balanceSubstrings 账号余额/配额耗尽措辞(仅 402 放行)。

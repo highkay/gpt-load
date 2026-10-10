@@ -222,14 +222,19 @@ func TestIsModelAccessDeniedError(t *testing.T) {
 		want bool
 	}{
 		{"dashscope-intl 403", "Model access denied.", true},
-		{"literal variant", "<403> Access to model denied. Please make sure you are eligible for using the model.", true},
 		{
 			"dashscope domestic 400",
 			"Access denied, please make sure your account has access to this model. For details, see: https://help.aliyun.com/",
 			true,
 		},
 		{"domestic case-insensitive", "Access Denied, please make sure your account HAS ACCESS TO THIS MODEL.", true},
-		// 回归护栏:审查/欠费/配额等非"模型权限"错误绝不能被学习层吞掉
+		// 回归护栏:审查/欠费/配额/账号级未购买等非"模型权限"错误绝不能被学习层吞掉
+		// (账号级未购买由 key_fatal_errors 立即出池,见 TestIsKeyFatalUpstreamError)
+		{
+			"account unpurchased (account-level, not model-scope)",
+			"Access to model denied. Please make sure you are eligible for using the model.",
+			false,
+		},
 		{"content moderation", "InternalError.Algo.DataInspectionFailed: Input text data may contain inappropriate content.", false},
 		{"arrearage", "Access denied, please make sure your account is in good standing. For details, see: https://help.aliyun.com/", false},
 		{"IP restriction", "IP access denied by API-Key restriction.", false},
