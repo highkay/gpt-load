@@ -132,7 +132,11 @@ func (l *modelLearner) strikesOf(groupID, keyID uint, model string) int {
 	if !ok {
 		return 0
 	}
-	return mm[model].strikes
+	e, ok := mm[model]
+	if !ok {
+		return 0
+	}
+	return e.strikes
 }
 
 // IsModelAccessDeniedError 判断上游错误是否属于"该 key 无此模型权限"类。

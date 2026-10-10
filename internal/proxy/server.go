@@ -263,14 +263,18 @@ func (ps *ProxyServer) executeRequestWithRetry(
 			return
 		}
 
-		// 使用解析后的错误信息更新密钥状态(带状态码:401 凭证失效/402 欠费可立即出池)
-		ps.keyProvider.UpdateStatus(apiKey, group, false, statusCode, parsedError)
-
-		// 自动学习:上游明确"模型权限拒绝" → 记录连续拒绝、指数退避排除
+		// 模型权限拒绝是 (key, model) 维度的能力信号,不是 key 健康信号:
+		// 交由学习层定向排除(strikes → 指数退避),不计 failure_count——
+		// 否则一把能正常服务其他模型的健康 key,会被"该模型不被上游放行"的
+		// 403 一路攒到 blacklist_threshold 误判出池(2026-09-26 qwenchina
+		// key 2426 实测:558 次 qwen3.8-flash 成功,被其他模型的 403 攒到 fc=30)。
 		if keypool.IsModelAccessDeniedError(parsedError) {
 			ps.keyProvider.RecordModelDenied(group.ID, apiKey.ID, model)
 			logrus.Infof("Learned: key %d cannot serve model '%s' (group %s, strikes=%d)",
 				apiKey.ID, model, group.Name, ps.keyProvider.StrikesOf(group.ID, apiKey.ID, model))
+		} else {
+			// 使用解析后的错误信息更新密钥状态(带状态码:401 凭证失效/402 欠费可立即出池)
+			ps.keyProvider.UpdateStatus(apiKey, group, false, statusCode, parsedError)
 		}
 
 		// 判断是否为最后一次尝试
