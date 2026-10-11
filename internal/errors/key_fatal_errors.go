@@ -29,6 +29,7 @@ var authSubstrings = []string{
 	"api key is invalid",
 	"invalid authentication",
 	"authentication_error",
+	"身份验证失败", // 智谱(open.bigmodel.cn)中文 401(2026-10-11 逆查发现,此前漏网只计 fc)
 }
 
 // keyRestrictionSubstrings key 级不可用的 403 措辞(仅 403 放行):
@@ -41,15 +42,20 @@ var keyRestrictionSubstrings = []string{
 }
 
 // accountEligibilitySubstrings 账号级资格/购买状态的 403 措辞(仅 403 放行):
-// "Access to model denied. Please make sure you are eligible for using the model."
-// (dashscope AccessDenied.Unpurchased)。作用:该账号无可用模型 → 与 402 欠费同类,
-// 立即 invalid 出池,缴费/开通后由小时级校验(CronChecker)自愈。
-// 【推断项】2026-10-10 治理时仅单一账号(key 881,全 24 模型含 qwen-plus 均命中)观测到,
-// 7 天 request_logs 零命中;若未来出现"仅个别模型 Unpurchased 但账号其他模型可用"的反例,
-// 应将其降级为 (key,model) 维度(移入 uncounted + 学习层)。
+//   - dashscope: "Access to model denied. Please make sure you are eligible for using the model."
+//     (AccessDenied.Unpurchased)。该账号无可用模型 → 与 402 欠费同类,立即 invalid 出池。
+//     【推断项】单账号(key 881,全 24 模型含 qwen-plus 均命中)观测,7 天 request_logs 零命中;
+//     若现"仅个别模型 Unpurchased 但账号其他模型可用"的反例,应降级为 (key,model) 维度。
+//   - ModelScope: "For account security, please complete your profile via email verification.
+//     ModelScope Magicubes is only available to verified accounts..."(2026-10-10 13:25 起
+//     实测爆发:30h 内 780 次、53 把 key 被 30 次慢出池;平台级账号要求,与模型无关 →
+//     立即出池,账号完成邮箱验证后由小时级校验自愈。active key x test_model 已实测可达,复验门正常)。
+// 命中后立即 invalid 出池;缴费/开通/验证完成后由 CronChecker 小时级复验自愈。
 var accountEligibilitySubstrings = []string{
 	"access to model denied",
 	"eligible for using the model",
+	"only available to verified accounts",
+	"complete your profile via email verification",
 }
 
 // balanceSubstrings 账号余额/配额耗尽措辞(仅 402 放行)。
