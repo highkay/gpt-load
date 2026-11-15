@@ -1,4 +1,4 @@
-package video
+package media
 
 import (
 	"errors"
@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestParseCreateRequestAppliesDefaultsAndModeRules(t *testing.T) {
+func TestParseOpenAIVideoCreateRequestPreservesClientFields(t *testing.T) {
 	t.Parallel()
 	valid := []struct {
 		name string
@@ -20,12 +20,13 @@ func TestParseCreateRequestAppliesDefaultsAndModeRules(t *testing.T) {
 		{name: "reference videos", body: `{"model":"m","prompt":"p","mode":"reference","videos":[{"url":"https://example.com/a.mp4","start_seconds":1.5,"require_audio":true}]}`},
 		{name: "seconds bounds", body: `{"model":"m","prompt":"p","seconds":"4"}`},
 		{name: "size 2K", body: `{"model":"m","prompt":"p","size":"2K"}`},
+		{name: "standard size", body: `{"model":"m","prompt":"p","seconds":"4","size":"1280x720"}`},
 	}
 	for _, test := range valid {
 		t.Run(test.name, func(t *testing.T) {
-			parsed, err := ParseCreateRequest([]byte(test.body))
+			parsed, err := ParseOpenAIVideoCreateRequest([]byte(test.body))
 			if err != nil {
-				t.Fatalf("ParseCreateRequest() error = %v", err)
+				t.Fatalf("ParseOpenAIVideoCreateRequest() error = %v", err)
 			}
 			if parsed.Model != "m" || parsed.Prompt != "p" {
 				t.Fatalf("parsed = %#v", parsed)
@@ -36,21 +37,21 @@ func TestParseCreateRequestAppliesDefaultsAndModeRules(t *testing.T) {
 		})
 	}
 
-	text, err := ParseCreateRequest([]byte(`{"model":"m","prompt":"p"}`))
+	text, err := ParseOpenAIVideoCreateRequest([]byte(`{"model":"m","prompt":"p"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text.Mode != "text" || text.Seconds != "5" || text.Size != "720P" || text.AspectRatio != "16:9" || text.N != 1 {
-		t.Fatalf("defaults = %#v", text)
+	if text.Mode != "" || text.Seconds != "" || text.Size != "" || text.AspectRatio != "" || text.N != 0 {
+		t.Fatalf("client fields were replaced = %#v", text)
 	}
-	for _, field := range []string{`"mode":"text"`, `"seconds":"5"`, `"size":"720P"`, `"aspect_ratio":"16:9"`, `"n":1`} {
-		if !strings.Contains(string(text.NormalizedBody), field) {
-			t.Fatalf("normalized body %s missing %s", text.NormalizedBody, field)
+	for _, field := range []string{`"mode"`, `"seconds"`, `"size"`, `"aspect_ratio"`, `"n"`} {
+		if strings.Contains(string(text.NormalizedBody), field) {
+			t.Fatalf("normalized body %s injected %s", text.NormalizedBody, field)
 		}
 	}
 }
 
-func TestParseCreateRequestRejectsInvalidShapes(t *testing.T) {
+func TestParseOpenAIVideoCreateRequestRejectsInvalidShapes(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name  string
@@ -61,14 +62,14 @@ func TestParseCreateRequestRejectsInvalidShapes(t *testing.T) {
 		{name: "missing model", body: `{"prompt":"p"}`, param: "model"},
 		{name: "missing prompt", body: `{"model":"m"}`, param: "prompt"},
 		{name: "bad mode", body: `{"model":"m","prompt":"p","mode":"other"}`, param: "mode"},
-		{name: "text with first frame", body: `{"model":"m","prompt":"p","first_frame":"https://example.com/a.png"}`, param: "mode"},
+		{name: "text with first frame", body: `{"model":"m","prompt":"p","mode":"text","first_frame":"https://example.com/a.png"}`, param: "mode"},
 		{name: "keyframe without frames", body: `{"model":"m","prompt":"p","mode":"keyframe"}`, param: "first_frame"},
 		{name: "keyframe with images", body: `{"model":"m","prompt":"p","mode":"keyframe","first_frame":"https://example.com/a.png","images":["https://example.com/a.png"]}`, param: "mode"},
 		{name: "reference without media", body: `{"model":"m","prompt":"p","mode":"reference"}`, param: "images"},
 		{name: "reference with frame", body: `{"model":"m","prompt":"p","mode":"reference","first_frame":"https://example.com/a.png"}`, param: "mode"},
 		{name: "seconds not string", body: `{"model":"m","prompt":"p","seconds":5}`, param: "seconds"},
-		{name: "seconds below range", body: `{"model":"m","prompt":"p","seconds":"3"}`, param: "seconds"},
-		{name: "seconds above range", body: `{"model":"m","prompt":"p","seconds":"13"}`, param: "seconds"},
+		{name: "seconds below range", body: `{"model":"m","prompt":"p","seconds":"0"}`, param: "seconds"},
+		{name: "seconds above range", body: `{"model":"m","prompt":"p","seconds":"61"}`, param: "seconds"},
 		{name: "bad size", body: `{"model":"m","prompt":"p","size":"4K"}`, param: "size"},
 		{name: "n not one", body: `{"model":"m","prompt":"p","n":2}`, param: "n"},
 		{name: "too many images", body: `{"model":"m","prompt":"p","mode":"reference","images":["https://e.com/1","https://e.com/2","https://e.com/3","https://e.com/4","https://e.com/5","https://e.com/6","https://e.com/7","https://e.com/8","https://e.com/9"]}`, param: "images"},
@@ -80,9 +81,9 @@ func TestParseCreateRequestRejectsInvalidShapes(t *testing.T) {
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := ParseCreateRequest([]byte(test.body))
+			_, err := ParseOpenAIVideoCreateRequest([]byte(test.body))
 			if err == nil {
-				t.Fatal("ParseCreateRequest() error = nil")
+				t.Fatal("ParseOpenAIVideoCreateRequest() error = nil")
 			}
 			var validation *ValidationError
 			if !errors.As(err, &validation) {
@@ -98,7 +99,7 @@ func TestParseCreateRequestRejectsInvalidShapes(t *testing.T) {
 func TestApplyUpstreamObservationPreservesStatusWhenUpstreamOmitsIt(t *testing.T) {
 	t.Parallel()
 	task := Task{Status: StatusCompleted, Progress: 100, ResultURL: "https://cdn.example/a.mp4"}
-	updated := ApplyUpstreamObservation(task, UpstreamResponse{})
+	updated := ApplyUpstreamObservation(task, OpenAIVideoUpstreamResponse{})
 	if updated.Status != StatusCompleted || updated.Progress != 100 || updated.ResultURL != "https://cdn.example/a.mp4" {
 		t.Fatalf("updated = %#v", updated)
 	}
@@ -128,42 +129,42 @@ func TestNormalizeStatusMapsProviderStates(t *testing.T) {
 	}
 }
 
-func TestSelectUpstreamTaskIDPrefersProviderIdentity(t *testing.T) {
+func TestSelectOpenAIVideoTaskIDPrefersProviderIdentity(t *testing.T) {
 	t.Parallel()
-	response := UpstreamResponse{ID: "id-1", TaskID: "task-1", VideoID: "video-1"}
-	if got := SelectUpstreamTaskID("openai", response); got != "id-1" {
+	response := OpenAIVideoUpstreamResponse{ID: "id-1", TaskID: "task-1", VideoID: "video-1"}
+	if got := SelectOpenAIVideoTaskID("openai", response); got != "id-1" {
 		t.Fatalf("openai id = %q", got)
 	}
-	if got := SelectUpstreamTaskID("agnes", response); got != "video-1" {
+	if got := SelectOpenAIVideoTaskID("agnes", response); got != "video-1" {
 		t.Fatalf("agnes id = %q", got)
 	}
 	response.VideoID = ""
-	if got := SelectUpstreamTaskID("agnes", response); got != "task-1" {
+	if got := SelectOpenAIVideoTaskID("agnes", response); got != "task-1" {
 		t.Fatalf("agnes fallback id = %q", got)
 	}
 	response.TaskID = ""
-	if got := SelectUpstreamTaskID("agnes", response); got != "id-1" {
+	if got := SelectOpenAIVideoTaskID("agnes", response); got != "id-1" {
 		t.Fatalf("agnes final fallback id = %q", got)
 	}
 }
 
-func TestParseUpstreamResponseKeepsURLAndError(t *testing.T) {
+func TestParseOpenAIVideoResponseKeepsURLAndError(t *testing.T) {
 	t.Parallel()
-	response, err := ParseUpstreamResponse([]byte(`{"id":"video_1","status":"completed","progress":100,"url":"https://cdn.example/v.mp4"}`))
+	response, err := ParseOpenAIVideoResponse([]byte(`{"id":"video_1","status":"completed","progress":100,"url":"https://cdn.example/v.mp4"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if response.Status != "completed" || response.URL != "https://cdn.example/v.mp4" || response.Progress == nil || *response.Progress != 100 {
 		t.Fatalf("response = %#v", response)
 	}
-	response, err = ParseUpstreamResponse([]byte(`{"id":"video_2","status":"failed","error":{"code":"upstream_error","message":"boom"}}`))
+	response, err = ParseOpenAIVideoResponse([]byte(`{"id":"video_2","status":"failed","error":{"code":"upstream_error","message":"boom"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if response.ErrorCode != "upstream_error" || response.ErrorMessage != "boom" {
 		t.Fatalf("error response = %#v", response)
 	}
-	if _, err := ParseUpstreamResponse([]byte(`not json`)); err == nil {
+	if _, err := ParseOpenAIVideoResponse([]byte(`not json`)); err == nil {
 		t.Fatal("malformed upstream response was accepted")
 	}
 }
@@ -189,7 +190,7 @@ func TestIdempotencyHashScopesToAccessKey(t *testing.T) {
 func TestApplyUpstreamObservationCompletedForcesProgress100(t *testing.T) {
 	t.Parallel()
 	progress := 42
-	updated := ApplyUpstreamObservation(Task{Status: StatusInProgress, Progress: 42}, UpstreamResponse{
+	updated := ApplyUpstreamObservation(Task{Status: StatusInProgress, Progress: 42}, OpenAIVideoUpstreamResponse{
 		Status: "completed", Progress: &progress,
 	})
 	if updated.Status != StatusCompleted || updated.Progress != 100 {

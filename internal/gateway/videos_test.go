@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -17,17 +19,17 @@ import (
 	"gpt-load/internal/dialect"
 	"gpt-load/internal/execution"
 	"gpt-load/internal/health"
+	"gpt-load/internal/media"
+	"gpt-load/internal/mediastore"
+	"gpt-load/internal/outboundproxy"
 	"gpt-load/internal/platform/config"
 	"gpt-load/internal/protocol"
-	"gpt-load/internal/scheduler"
 	"gpt-load/internal/state"
 	"gpt-load/internal/testutil/encryptiontest"
 	"gpt-load/internal/testutil/sqlitetest"
-	"gpt-load/internal/video"
-	"gpt-load/internal/videostore"
 )
 
-func newVideoGatewayFixture(t *testing.T) (*gin.Engine, *Handler, *videostore.Store, *state.Manager, *state.CredentialRegistry, *scriptedForwarder) {
+func newVideoGatewayFixture(t *testing.T) (*gin.Engine, *Handler, *mediastore.Store, *state.Manager, *state.CredentialRegistry, *scriptedForwarder) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	keyService := encryptiontest.Service(t, "video-handler-test-master-key")
@@ -77,12 +79,12 @@ func newVideoGatewayFixture(t *testing.T) (*gin.Engine, *Handler, *videostore.St
 	if err := registry.ReplaceCredentials(entries); err != nil {
 		t.Fatalf("ReplaceCredentials() error = %v", err)
 	}
-	store := videostore.NewStore(sqlitetest.OpenMigrated(t))
+	store := mediastore.NewStore(sqlitetest.OpenMigrated(t))
 	handler := NewHandler(
 		manager, registry, keyService, forwarder, dialect.NewSet(dialect.NewOpenAIVideos()),
 		health.NewStatsStore(), health.NewMutationCoordinator(), nil, nil, nil,
 	)
-	handler.ConfigureVideoTasks(store)
+	handler.ConfigureMediaTasks(store)
 	engine := gin.New()
 	bindGatewayRoutesForTest(t, engine, handler)
 	return engine, handler, store, manager, registry, forwarder
@@ -138,6 +140,10 @@ func TestVideoCreateRetrieveAndPinning(t *testing.T) {
 	if task.GroupID != 1 || task.CredentialID != forwarder.inputs[0].Credential.ID ||
 		task.UpstreamTaskID != "task_up_1" || task.UpstreamModel != "agnes-video-2.5-flash" {
 		t.Fatalf("binding = %#v", task)
+	}
+	boundRef, ok := registry.CredentialRef(task.CredentialID)
+	if !ok || task.CredentialIdentityGeneration != boundRef.IdentityGeneration {
+		t.Fatalf("identity generation = %d, ref = %#v", task.CredentialIdentityGeneration, boundRef)
 	}
 	boundCredential := task.CredentialID
 	if boundCredential == 0 {
@@ -243,6 +249,70 @@ func TestVideoCreateRotatesTransportFailure(t *testing.T) {
 	}
 }
 
+func TestVideoCreateForwardsStandardOpenAIParameters(t *testing.T) {
+	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
+	forwarder.results = []UpstreamResult{videoUpstreamSuccess("task_up_standard")}
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(
+		`{"model":"sora-2","prompt":"fox","seconds":"4","size":"1280x720"}`,
+	))
+	request.Header.Set("Authorization", "Bearer gl-video")
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	body := string(forwarder.inputs[0].Request.Body)
+	if !strings.Contains(body, `"size":"1280x720"`) || !strings.Contains(body, `"seconds":"4"`) {
+		t.Fatalf("standard parameters were not forwarded: %s", body)
+	}
+	if strings.Contains(body, `"mode"`) || strings.Contains(body, `"aspect_ratio"`) {
+		t.Fatalf("OpenAI request was given Agnes defaults: %s", body)
+	}
+}
+
+func TestVideoCreateMultipartForwardsReferenceFile(t *testing.T) {
+	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
+	forwarder.results = []UpstreamResult{videoUpstreamSuccess("task_up_multipart")}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range map[string]string{
+		"model": "sora-2", "prompt": "fox", "seconds": "4", "size": "1280x720",
+	} {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", `form-data; name="input_reference"; filename="ref.png"`)
+	header.Set("Content-Type", "image/png")
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("png-bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", bytes.NewReader(body.Bytes()))
+	request.Header.Set("Authorization", "Bearer gl-video")
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	input := forwarder.inputs[0]
+	if !strings.HasPrefix(input.Request.Header.Get("Content-Type"), "multipart/form-data; boundary=") {
+		t.Fatalf("forwarded content type = %q", input.Request.Header.Get("Content-Type"))
+	}
+	if !bytes.Contains(input.Request.Body, []byte("png-bytes")) {
+		t.Fatal("reference file was not forwarded")
+	}
+}
+
 func TestVideoCreateUnusual403CoolsAndRotates(t *testing.T) {
 	engine, _, _, _, registry, forwarder := newVideoGatewayFixture(t)
 	forwarder.results = []UpstreamResult{
@@ -287,11 +357,26 @@ func TestVideoCreateMissingTaskIDDoesNotRetry(t *testing.T) {
 	}
 }
 
-func TestVideoCreateRetriesServerErrorWithoutTaskID(t *testing.T) {
+func TestVideoCreateDoesNotRetryAmbiguousServerError(t *testing.T) {
 	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
 	forwarder.results = []UpstreamResult{
 		{StatusCode: http.StatusInternalServerError, DispatchState: execution.DispatchMaybeSent, ResponseStarted: true, Body: []byte(`{}`)},
 		videoUpstreamSuccess("task_up_4"),
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"sora-2","prompt":"fox"}`))
+	request.Header.Set("Authorization", "Bearer gl-video")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadGateway || len(forwarder.inputs) != 1 {
+		t.Fatalf("status = %d attempts = %d body = %s", recorder.Code, len(forwarder.inputs), recorder.Body.String())
+	}
+}
+
+func TestVideoCreateRetriesServerErrorBeforeDispatch(t *testing.T) {
+	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
+	forwarder.results = []UpstreamResult{
+		{StatusCode: http.StatusInternalServerError, DispatchState: execution.DispatchNotSent, ResponseStarted: true, Body: []byte(`{}`)},
+		videoUpstreamSuccess("task_up_safe"),
 	}
 	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"sora-2","prompt":"fox"}`))
 	request.Header.Set("Authorization", "Bearer gl-video")
@@ -307,7 +392,7 @@ func TestVideoCreateValidationDoesNotReachUpstream(t *testing.T) {
 	cases := []string{
 		`{"model":"sora-2","prompt":"fox","mode":"keyframe"}`,
 		`{"model":"sora-2","prompt":"fox","mode":"reference"}`,
-		`{"model":"sora-2","prompt":"fox","seconds":"3"}`,
+		`{"model":"sora-2","prompt":"fox","seconds":"0"}`,
 		`{"model":"sora-2","prompt":"fox","n":2}`,
 	}
 	for _, body := range cases {
@@ -377,7 +462,7 @@ func TestVideoTaskExpiryAndDelete(t *testing.T) {
 		{
 			StatusCode: http.StatusOK, DispatchState: execution.DispatchMaybeSent, ResponseStarted: true,
 			Header: http.Header{"Content-Type": {"application/json"}},
-			Body:   []byte(`{"id":"task_up_6","status":"completed","url":"https://cdn.example/video.mp4"}`),
+			Body:   []byte(`{"id":"task_up_6","status":"completed","url":"https://cdn.example/media.mp4"}`),
 		},
 	}
 	request = httptest.NewRequest(http.MethodGet, "/v1/videos/"+id, nil)
@@ -396,7 +481,7 @@ func TestVideoTaskExpiryAndDelete(t *testing.T) {
 		{
 			StatusCode: http.StatusOK, DispatchState: execution.DispatchMaybeSent, ResponseStarted: true,
 			Header: http.Header{"Content-Type": {"application/json"}},
-			Body:   []byte(`{"id":"task_up_6","status":"completed","url":"https://cdn.example/video.mp4"}`),
+			Body:   []byte(`{"id":"task_up_6","status":"completed","url":"https://cdn.example/media.mp4"}`),
 		},
 		{StatusCode: http.StatusNoContent, DispatchState: execution.DispatchMaybeSent, ResponseStarted: true},
 	}
@@ -408,7 +493,7 @@ func TestVideoTaskExpiryAndDelete(t *testing.T) {
 		t.Fatalf("delete status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 	task, err := store.Get(request.Context(), 1, id)
-	if err != nil || task.Status != video.StatusCancelled {
+	if err != nil || task.Status != media.StatusCancelled {
 		t.Fatalf("cancelled task = %#v err = %v", task, err)
 	}
 
@@ -477,7 +562,7 @@ func TestVideoCreateStopsAtThreeAttempts(t *testing.T) {
 	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
 	for i := 0; i < 4; i++ {
 		forwarder.results = append(forwarder.results, UpstreamResult{
-			StatusCode: http.StatusInternalServerError, DispatchState: execution.DispatchMaybeSent,
+			StatusCode: http.StatusInternalServerError, DispatchState: execution.DispatchNotSent,
 			ResponseStarted: true, Body: []byte(`{}`),
 		})
 	}
@@ -521,53 +606,80 @@ func TestVideoDeleteFailureDoesNotMarkTaskCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.Status == video.StatusCancelled {
+	if task.Status == media.StatusCancelled {
 		t.Fatal("failed delete was persisted as cancelled")
 	}
 }
 
-func TestVideoFinalizePersistsBindingAfterParentCancellation(t *testing.T) {
-	_, handler, store, _, _, _ := newVideoGatewayFixture(t)
-	create := video.CreateRequest{Model: "sora-2", Mode: "text", Seconds: "5", Size: "720P", AspectRatio: "16:9"}
-	task, err := store.NewTask(1, create, "")
+type cancelAfterForward struct {
+	*scriptedForwarder
+	cancel context.CancelFunc
+}
+
+func (forwarder *cancelAfterForward) Forward(ctx context.Context, input ForwardInput) UpstreamResult {
+	result := forwarder.scriptedForwarder.Forward(ctx, input)
+	forwarder.cancel()
+	return result
+}
+
+func TestVideoBindingSurvivesClientDisconnect(t *testing.T) {
+	engine, handler, store, _, _, forwarder := newVideoGatewayFixture(t)
+	forwarder.results = []UpstreamResult{videoUpstreamSuccess("task_up_disconnect")}
+	ctx, cancel := context.WithCancel(context.Background())
+	handler.forwarder = &cancelAfterForward{scriptedForwarder: forwarder, cancel: cancel}
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"sora-2","prompt":"fox"}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer gl-video")
+	request.Header.Set("Idempotency-Key", "disconnect-key")
+	engine.ServeHTTP(httptest.NewRecorder(), request)
+
+	replay := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"sora-2","prompt":"fox"}`))
+	replay.Header.Set("Authorization", "Bearer gl-video")
+	replay.Header.Set("Idempotency-Key", "disconnect-key")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, replay)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("replay status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	id, _ := videoJSONResponse(t, recorder)["id"].(string)
+	task, err := store.Get(context.Background(), 1, id)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("binding was not persisted after disconnect: %v", err)
 	}
-	task, _, err = store.Reserve(context.Background(), task)
-	if err != nil {
-		t.Fatal(err)
+	if task.UpstreamTaskID != "task_up_disconnect" {
+		t.Fatalf("binding = %#v", task)
 	}
-	state := &videoRequestState{
-		store: store, create: &create, reservation: task, reserved: true,
-	}
-	parent, cancel := context.WithCancel(context.Background())
-	cancel()
-	writeCtx, cancelWrite := videoWriteContext(parent)
-	defer cancelWrite()
-	normalized, failure := handler.finalizeVideoCreate(
-		writeCtx, state,
-		scheduler.Selection{GroupID: 1, ChannelID: channel.OpenAI},
-		stateAccessCredentialRef(),
-		videoUpstreamSuccess("task_up_disconnect"), "sora-2", "sora-2",
-	)
-	if failure != nil {
-		t.Fatalf("finalize failed after parent cancellation: %#v", failure)
-	}
-	if normalized.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", normalized.StatusCode)
-	}
-	persisted, err := store.Get(context.Background(), 1, task.ID)
-	if err != nil {
-		t.Fatalf("binding was not persisted: %v", err)
-	}
-	if persisted.UpstreamTaskID != "task_up_disconnect" || persisted.CredentialID != 1 {
-		t.Fatalf("binding = %#v", persisted)
-	}
-	if !state.finalized {
-		t.Fatal("state was not marked finalized")
+	if len(forwarder.inputs) != 1 {
+		t.Fatalf("upstream calls = %d, want 1", len(forwarder.inputs))
 	}
 }
 
-func stateAccessCredentialRef() state.CredentialRef {
-	return state.CredentialRef{ID: 1, GroupID: 1}
+func TestValidatePublicVideoURLRejectsPrivateTargets(t *testing.T) {
+	for _, raw := range []string{
+		"http://127.0.0.1/x", "http://127.1.2.3/x", "http://169.254.169.254/latest/meta-data",
+		"http://10.0.0.1/x", "http://192.168.1.1/x", "http://100.64.0.1/x", "http://[::1]/x",
+		"http://0.0.0.0/x", "http://localhost/x", "ftp://1.1.1.1/x", "http://user:pass@1.1.1.1/x",
+	} {
+		if err := validatePublicVideoURL(context.Background(), raw); err == nil {
+			t.Fatalf("validatePublicVideoURL(%q) accepted a private/invalid target", raw)
+		}
+	}
+	if err := validatePublicVideoURL(context.Background(), "http://1.1.1.1/x"); err != nil {
+		t.Fatalf("public literal rejected: %v", err)
+	}
+}
+
+func TestVideoHTTPClientRedirectRejectsPrivateTarget(t *testing.T) {
+	client, err := newMediaHTTPClient(outboundproxy.Effective{}, state.TimeoutConfig{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := httptest.NewRequest(http.MethodGet, "http://1.1.1.1/first", nil)
+	redirect := httptest.NewRequest(http.MethodGet, "http://169.254.169.254/latest/meta-data", nil)
+	if err := client.CheckRedirect(redirect, []*http.Request{original}); err == nil {
+		t.Fatal("private redirect target was accepted")
+	}
+	public := httptest.NewRequest(http.MethodGet, "http://1.1.1.1/second", nil)
+	if err := client.CheckRedirect(public, []*http.Request{original}); err != nil {
+		t.Fatalf("public redirect target rejected: %v", err)
+	}
 }
