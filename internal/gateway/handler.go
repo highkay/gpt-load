@@ -726,10 +726,16 @@ func (handler *Handler) Handle(ginContext *gin.Context) {
 	recorder.setStream(metadata.Stream)
 	var boundAuto *automodel.Selection
 	autoQuery := scheduler.Query{}
-	if metadata.PreviousResponseID != "" {
-		binding, found := handler.responseBindings.Lookup(accessKey.ID, metadata.PreviousResponseID)
+	responseOwnershipID := metadata.PreviousResponseID
+	responseOwnershipMissing := reasonResponseBindingNotFound
+	if metadata.ResponseResourceID != "" {
+		responseOwnershipID = metadata.ResponseResourceID
+		responseOwnershipMissing = reasonResponseResourceNotFound
+	}
+	if responseOwnershipID != "" {
+		binding, found := handler.responseBindings.Lookup(accessKey.ID, responseOwnershipID)
 		if !found {
-			handler.completeReason(ginContext, recorder, reasonResponseBindingNotFound)
+			handler.completeReason(ginContext, recorder, responseOwnershipMissing)
 			return
 		}
 		boundAuto = binding.AutoSelection
@@ -796,10 +802,10 @@ func (handler *Handler) Handle(ginContext *gin.Context) {
 		allowedCredentialRefs = map[uint]state.CredentialRef{pinned.ID: pinned}
 		query.AllowedCredentialIDs = map[uint]struct{}{pinned.ID: {}}
 		query.AllowedCredentialRefs = map[uint]state.CredentialRef{pinned.ID: pinned}
-	} else if metadata.PreviousResponseID != "" {
-		binding, found := handler.responseBindings.Lookup(accessKey.ID, metadata.PreviousResponseID)
+	} else if responseOwnershipID != "" {
+		binding, found := handler.responseBindings.Lookup(accessKey.ID, responseOwnershipID)
 		if !found {
-			handler.completeReason(ginContext, recorder, reasonResponseBindingNotFound)
+			handler.completeReason(ginContext, recorder, responseOwnershipMissing)
 			return
 		}
 		query.AllowedCredentialIDs = map[uint]struct{}{binding.CredentialID: {}}
