@@ -28,6 +28,7 @@ type RequestMetadata struct {
 	RouteRequirement         execution.RouteRequirement
 	ResponsesStorePreference execution.ResponsesStorePreference
 	PreviousResponseID       string
+	ResponseResourceID       string
 	// MediaTaskID is the client-visible gateway media task identifier parsed from
 	// one resource path. Create requests leave it empty.
 	MediaTaskID string
