@@ -3,6 +3,8 @@ package mediastore
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -124,6 +126,127 @@ func TestStoreMarkCancelledAndCleanup(t *testing.T) {
 	}
 	if _, err := store.Get(context.Background(), 1, task.ID); !errors.Is(err, media.ErrNotFound) {
 		t.Fatalf("cleanup did not remove expired task: %v", err)
+	}
+}
+
+func TestStoreUpdateObservationDoesNotOverwriteCancelled(t *testing.T) {
+	store := NewStore(sqlitetest.OpenMigrated(t))
+	now := time.Unix(1_800_000_000, 0)
+	store.SetClock(func() time.Time { return now })
+	store.SetTTL(time.Hour)
+	request := media.NewTaskParams{Protocol: "openai-videos", Operation: "videos_create", Kind: "video", ClientModel: "video-model", Mode: "text", Seconds: "5", Size: "720P", AspectRatio: "16:9"}
+	task, err := store.NewTask(1, request, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _, err = store.Reserve(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkCancelled(context.Background(), 1, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	task.Status = media.StatusInProgress
+	task.Progress = 10
+	if err := store.UpdateObservation(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(context.Background(), 1, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != media.StatusCancelled || got.Progress != 0 {
+		t.Fatalf("late observation overwrote terminal state: %#v", got)
+	}
+}
+
+func TestStorePersistsCredentialIdentityGeneration(t *testing.T) {
+	store := NewStore(sqlitetest.OpenMigrated(t))
+	now := time.Unix(1_800_000_000, 0)
+	store.SetClock(func() time.Time { return now })
+	store.SetTTL(time.Hour)
+	request := media.NewTaskParams{Protocol: "openai-videos", Operation: "videos_create", Kind: "video", ClientModel: "video-model"}
+	task, err := store.NewTask(1, request, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _, err = store.Reserve(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.CredentialIdentityGeneration = 9
+	if err := store.UpdateCreateResult(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(context.Background(), 1, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CredentialIdentityGeneration != 9 {
+		t.Fatalf("identity generation = %d, want 9", got.CredentialIdentityGeneration)
+	}
+}
+
+func TestStoreReserveIdempotencyRaceKeepsOneWinner(t *testing.T) {
+	store := NewStore(sqlitetest.OpenMigrated(t))
+	now := time.Unix(1_800_000_000, 0)
+	store.SetClock(func() time.Time { return now })
+	store.SetTTL(time.Hour)
+	request := media.NewTaskParams{Protocol: "openai-videos", Operation: "videos_create", Kind: "video", ClientModel: "video-model"}
+	hash, err := media.IdempotencyHash(1, "race-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired, err := store.NewTask(1, request, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired.ExpiresAtMS = now.Add(-time.Minute).UnixMilli()
+	if err := store.db.Create(&expired).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var createdCount atomic.Int64
+	results := make(chan media.Task, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			task, taskErr := store.NewTask(1, request, hash)
+			if taskErr != nil {
+				t.Error(taskErr)
+				return
+			}
+			got, created, reserveErr := store.Reserve(context.Background(), task)
+			if reserveErr != nil {
+				t.Error(reserveErr)
+				return
+			}
+			if created {
+				createdCount.Add(1)
+			}
+			results <- got
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	ids := make(map[string]struct{})
+	for got := range results {
+		ids[got.ID] = struct{}{}
+	}
+	if len(ids) != 1 || createdCount.Load() != 1 {
+		t.Fatalf("race results = %d ids, %d created, want 1 and 1", len(ids), createdCount.Load())
+	}
+	var count int64
+	if err := store.db.Model(&media.Task{}).Where("idempotency_key = ?", hash).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("idempotency rows = %d, want 1", count)
 	}
 }
 

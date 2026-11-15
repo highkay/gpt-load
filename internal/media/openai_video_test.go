@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestParseOpenAIVideoCreateRequestAppliesDefaultsAndModeRules(t *testing.T) {
+func TestParseOpenAIVideoCreateRequestPreservesClientFields(t *testing.T) {
 	t.Parallel()
 	valid := []struct {
 		name string
@@ -20,6 +20,7 @@ func TestParseOpenAIVideoCreateRequestAppliesDefaultsAndModeRules(t *testing.T) 
 		{name: "reference videos", body: `{"model":"m","prompt":"p","mode":"reference","videos":[{"url":"https://example.com/a.mp4","start_seconds":1.5,"require_audio":true}]}`},
 		{name: "seconds bounds", body: `{"model":"m","prompt":"p","seconds":"4"}`},
 		{name: "size 2K", body: `{"model":"m","prompt":"p","size":"2K"}`},
+		{name: "standard size", body: `{"model":"m","prompt":"p","seconds":"4","size":"1280x720"}`},
 	}
 	for _, test := range valid {
 		t.Run(test.name, func(t *testing.T) {
@@ -40,12 +41,12 @@ func TestParseOpenAIVideoCreateRequestAppliesDefaultsAndModeRules(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if text.Mode != "text" || text.Seconds != "5" || text.Size != "720P" || text.AspectRatio != "16:9" || text.N != 1 {
-		t.Fatalf("defaults = %#v", text)
+	if text.Mode != "" || text.Seconds != "" || text.Size != "" || text.AspectRatio != "" || text.N != 0 {
+		t.Fatalf("client fields were replaced = %#v", text)
 	}
-	for _, field := range []string{`"mode":"text"`, `"seconds":"5"`, `"size":"720P"`, `"aspect_ratio":"16:9"`, `"n":1`} {
-		if !strings.Contains(string(text.NormalizedBody), field) {
-			t.Fatalf("normalized body %s missing %s", text.NormalizedBody, field)
+	for _, field := range []string{`"mode"`, `"seconds"`, `"size"`, `"aspect_ratio"`, `"n"`} {
+		if strings.Contains(string(text.NormalizedBody), field) {
+			t.Fatalf("normalized body %s injected %s", text.NormalizedBody, field)
 		}
 	}
 }
@@ -61,14 +62,14 @@ func TestParseOpenAIVideoCreateRequestRejectsInvalidShapes(t *testing.T) {
 		{name: "missing model", body: `{"prompt":"p"}`, param: "model"},
 		{name: "missing prompt", body: `{"model":"m"}`, param: "prompt"},
 		{name: "bad mode", body: `{"model":"m","prompt":"p","mode":"other"}`, param: "mode"},
-		{name: "text with first frame", body: `{"model":"m","prompt":"p","first_frame":"https://example.com/a.png"}`, param: "mode"},
+		{name: "text with first frame", body: `{"model":"m","prompt":"p","mode":"text","first_frame":"https://example.com/a.png"}`, param: "mode"},
 		{name: "keyframe without frames", body: `{"model":"m","prompt":"p","mode":"keyframe"}`, param: "first_frame"},
 		{name: "keyframe with images", body: `{"model":"m","prompt":"p","mode":"keyframe","first_frame":"https://example.com/a.png","images":["https://example.com/a.png"]}`, param: "mode"},
 		{name: "reference without media", body: `{"model":"m","prompt":"p","mode":"reference"}`, param: "images"},
 		{name: "reference with frame", body: `{"model":"m","prompt":"p","mode":"reference","first_frame":"https://example.com/a.png"}`, param: "mode"},
 		{name: "seconds not string", body: `{"model":"m","prompt":"p","seconds":5}`, param: "seconds"},
-		{name: "seconds below range", body: `{"model":"m","prompt":"p","seconds":"3"}`, param: "seconds"},
-		{name: "seconds above range", body: `{"model":"m","prompt":"p","seconds":"13"}`, param: "seconds"},
+		{name: "seconds below range", body: `{"model":"m","prompt":"p","seconds":"0"}`, param: "seconds"},
+		{name: "seconds above range", body: `{"model":"m","prompt":"p","seconds":"61"}`, param: "seconds"},
 		{name: "bad size", body: `{"model":"m","prompt":"p","size":"4K"}`, param: "size"},
 		{name: "n not one", body: `{"model":"m","prompt":"p","n":2}`, param: "n"},
 		{name: "too many images", body: `{"model":"m","prompt":"p","mode":"reference","images":["https://e.com/1","https://e.com/2","https://e.com/3","https://e.com/4","https://e.com/5","https://e.com/6","https://e.com/7","https://e.com/8","https://e.com/9"]}`, param: "images"},

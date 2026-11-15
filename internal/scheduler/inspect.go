@@ -114,10 +114,10 @@ func evaluateTargets(
 		}
 	}
 	if len(query.accessKey.Filters.Models) > 0 {
-		if query.externalModel == nil {
+		if query.filterModel == nil {
 			return []targetDecision{}, ReasonModelRequiredByFilter, nil
 		}
-		if _, allowed := query.accessKey.Filters.Models[*query.externalModel]; !allowed {
+		if _, allowed := query.accessKey.Filters.Models[*query.filterModel]; !allowed {
 			return []targetDecision{}, ReasonModelFiltered, nil
 		}
 	}

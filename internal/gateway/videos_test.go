@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"strings"
 	"testing"
 	"time"
@@ -139,6 +141,10 @@ func TestVideoCreateRetrieveAndPinning(t *testing.T) {
 		task.UpstreamTaskID != "task_up_1" || task.UpstreamModel != "agnes-video-2.5-flash" {
 		t.Fatalf("binding = %#v", task)
 	}
+	boundRef, ok := registry.CredentialRef(task.CredentialID)
+	if !ok || task.CredentialIdentityGeneration != boundRef.IdentityGeneration {
+		t.Fatalf("identity generation = %d, ref = %#v", task.CredentialIdentityGeneration, boundRef)
+	}
 	boundCredential := task.CredentialID
 	if boundCredential == 0 {
 		t.Fatal("binding did not record a credential")
@@ -243,6 +249,70 @@ func TestVideoCreateRotatesTransportFailure(t *testing.T) {
 	}
 }
 
+func TestVideoCreateForwardsStandardOpenAIParameters(t *testing.T) {
+	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
+	forwarder.results = []UpstreamResult{videoUpstreamSuccess("task_up_standard")}
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(
+		`{"model":"sora-2","prompt":"fox","seconds":"4","size":"1280x720"}`,
+	))
+	request.Header.Set("Authorization", "Bearer gl-video")
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	body := string(forwarder.inputs[0].Request.Body)
+	if !strings.Contains(body, `"size":"1280x720"`) || !strings.Contains(body, `"seconds":"4"`) {
+		t.Fatalf("standard parameters were not forwarded: %s", body)
+	}
+	if strings.Contains(body, `"mode"`) || strings.Contains(body, `"aspect_ratio"`) {
+		t.Fatalf("OpenAI request was given Agnes defaults: %s", body)
+	}
+}
+
+func TestVideoCreateMultipartForwardsReferenceFile(t *testing.T) {
+	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
+	forwarder.results = []UpstreamResult{videoUpstreamSuccess("task_up_multipart")}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range map[string]string{
+		"model": "sora-2", "prompt": "fox", "seconds": "4", "size": "1280x720",
+	} {
+		if err := writer.WriteField(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", `form-data; name="input_reference"; filename="ref.png"`)
+	header.Set("Content-Type", "image/png")
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("png-bytes")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", bytes.NewReader(body.Bytes()))
+	request.Header.Set("Authorization", "Bearer gl-video")
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	input := forwarder.inputs[0]
+	if !strings.HasPrefix(input.Request.Header.Get("Content-Type"), "multipart/form-data; boundary=") {
+		t.Fatalf("forwarded content type = %q", input.Request.Header.Get("Content-Type"))
+	}
+	if !bytes.Contains(input.Request.Body, []byte("png-bytes")) {
+		t.Fatal("reference file was not forwarded")
+	}
+}
+
 func TestVideoCreateUnusual403CoolsAndRotates(t *testing.T) {
 	engine, _, _, _, registry, forwarder := newVideoGatewayFixture(t)
 	forwarder.results = []UpstreamResult{
@@ -287,11 +357,26 @@ func TestVideoCreateMissingTaskIDDoesNotRetry(t *testing.T) {
 	}
 }
 
-func TestVideoCreateRetriesServerErrorWithoutTaskID(t *testing.T) {
+func TestVideoCreateDoesNotRetryAmbiguousServerError(t *testing.T) {
 	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
 	forwarder.results = []UpstreamResult{
 		{StatusCode: http.StatusInternalServerError, DispatchState: execution.DispatchMaybeSent, ResponseStarted: true, Body: []byte(`{}`)},
 		videoUpstreamSuccess("task_up_4"),
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"sora-2","prompt":"fox"}`))
+	request.Header.Set("Authorization", "Bearer gl-video")
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadGateway || len(forwarder.inputs) != 1 {
+		t.Fatalf("status = %d attempts = %d body = %s", recorder.Code, len(forwarder.inputs), recorder.Body.String())
+	}
+}
+
+func TestVideoCreateRetriesServerErrorBeforeDispatch(t *testing.T) {
+	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
+	forwarder.results = []UpstreamResult{
+		{StatusCode: http.StatusInternalServerError, DispatchState: execution.DispatchNotSent, ResponseStarted: true, Body: []byte(`{}`)},
+		videoUpstreamSuccess("task_up_safe"),
 	}
 	request := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{"model":"sora-2","prompt":"fox"}`))
 	request.Header.Set("Authorization", "Bearer gl-video")
@@ -307,7 +392,7 @@ func TestVideoCreateValidationDoesNotReachUpstream(t *testing.T) {
 	cases := []string{
 		`{"model":"sora-2","prompt":"fox","mode":"keyframe"}`,
 		`{"model":"sora-2","prompt":"fox","mode":"reference"}`,
-		`{"model":"sora-2","prompt":"fox","seconds":"3"}`,
+		`{"model":"sora-2","prompt":"fox","seconds":"0"}`,
 		`{"model":"sora-2","prompt":"fox","n":2}`,
 	}
 	for _, body := range cases {
@@ -477,7 +562,7 @@ func TestVideoCreateStopsAtThreeAttempts(t *testing.T) {
 	engine, _, _, _, _, forwarder := newVideoGatewayFixture(t)
 	for i := 0; i < 4; i++ {
 		forwarder.results = append(forwarder.results, UpstreamResult{
-			StatusCode: http.StatusInternalServerError, DispatchState: execution.DispatchMaybeSent,
+			StatusCode: http.StatusInternalServerError, DispatchState: execution.DispatchNotSent,
 			ResponseStarted: true, Body: []byte(`{}`),
 		})
 	}

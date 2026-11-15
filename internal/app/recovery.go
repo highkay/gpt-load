@@ -1,6 +1,8 @@
 package app
 
 import (
+	"net/http"
+
 	app_errors "gpt-load/internal/platform/errors"
 	"gpt-load/internal/platform/response"
 
@@ -15,6 +17,10 @@ func recoveryMiddleware() gin.HandlerFunc {
 		defer func() {
 			if recovered := recover(); recovered == nil {
 				return
+			} else if recovered == http.ErrAbortHandler {
+				// Let net/http close the connection instead of finishing a
+				// partially written response as a normal success.
+				panic(recovered)
 			}
 
 			logrus.Error("Recovered from HTTP handler panic")

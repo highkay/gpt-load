@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -43,12 +44,18 @@ func (d *OpenAIVideos) InspectRequest(request *ParsedRequest) (RequestMetadata, 
 		if request.Method != http.MethodPost {
 			return RequestMetadata{}, fmt.Errorf("%s only supports POST on %s", d.Protocol(), openAIVideosPath)
 		}
-		parsed, err := media.ParseOpenAIVideoCreateRequest(request.Body)
+		parsed, err := media.ParseOpenAIVideoCreateRequestForContentType(request.Body, request.Header.Get("Content-Type"))
 		if err != nil {
 			return RequestMetadata{}, err
 		}
 		model := parsed.Model
 		request.Body = parsed.NormalizedBody
+		if parsed.ContentType != "" {
+			if request.Header == nil {
+				request.Header = make(http.Header)
+			}
+			request.Header.Set("Content-Type", parsed.ContentType)
+		}
 		return RequestMetadata{
 			Model: &model, Operation: execution.OperationVideosCreate,
 			MediaCreate: &media.MediaCreate{
@@ -99,6 +106,23 @@ func (d *OpenAIVideos) RewriteRequestModel(request *ParsedRequest, model string)
 	if request.Path != openAIVideosPath {
 		return cloneParsedRequest(request)
 	}
+	contentType := request.Header.Get("Content-Type")
+	if mediaType, _, _ := mime.ParseMediaType(contentType); mediaType == "multipart/form-data" {
+		body, normalizedType, err := media.RewriteOpenAIVideoMultipartModel(request.Body, contentType, model)
+		if err != nil {
+			return nil, err
+		}
+		clone, err := cloneParsedRequest(request)
+		if err != nil {
+			return nil, err
+		}
+		clone.Body = body
+		if clone.Header == nil {
+			clone.Header = make(http.Header)
+		}
+		clone.Header.Set("Content-Type", normalizedType)
+		return clone, nil
+	}
 	parsed, err := media.ParseOpenAIVideoCreateRequest(request.Body)
 	if err != nil {
 		return nil, err
@@ -137,6 +161,23 @@ func (d *OpenAIVideos) SanitizeRequestForAttempt(
 	}
 	if request.Path != openAIVideosPath {
 		return cloneParsedRequest(request)
+	}
+	contentType := request.Header.Get("Content-Type")
+	if mediaType, _, _ := mime.ParseMediaType(contentType); mediaType == "multipart/form-data" {
+		body, normalizedType, err := media.RewriteOpenAIVideoMultipartModel(request.Body, contentType, model)
+		if err != nil {
+			return nil, err
+		}
+		clone, err := cloneParsedRequest(request)
+		if err != nil {
+			return nil, err
+		}
+		clone.Body = body
+		if clone.Header == nil {
+			clone.Header = make(http.Header)
+		}
+		clone.Header.Set("Content-Type", normalizedType)
+		return clone, nil
 	}
 	parsed, err := media.ParseOpenAIVideoCreateRequest(request.Body)
 	if err != nil {

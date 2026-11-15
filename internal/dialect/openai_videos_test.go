@@ -26,7 +26,8 @@ func TestOpenAIVideosInspectRequest(t *testing.T) {
 		metadata.RouteRequirement != execution.RouteRequirementNative {
 		t.Fatalf("create metadata = %#v", metadata)
 	}
-	if !strings.Contains(string(request.Body), `"mode":"text"`) {
+	if !strings.Contains(string(request.Body), `"model":"agnes-video-2.5-flash"`) ||
+		strings.Contains(string(request.Body), `"mode"`) {
 		t.Fatalf("create body was not normalized: %s", request.Body)
 	}
 

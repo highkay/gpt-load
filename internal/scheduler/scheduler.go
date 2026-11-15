@@ -26,10 +26,14 @@ type Query struct {
 	RouteRequirement         execution.RouteRequirement
 	ResponsesStorePreference execution.ResponsesStorePreference
 	ExternalModel            *string
-	AccessKey                state.AccessKeyView
-	AllowedCredentialIDs     map[uint]struct{}
-	PreferredCredentialID    uint
-	AllowedCredentialRefs    map[uint]state.CredentialRef
+	// FilterModel is the model used for access-key model filters. Resource
+	// operations keep ExternalModel nil while still filtering on the bound task
+	// model, so route lookup stays on NoModelRouteKey.
+	FilterModel           *string
+	AccessKey             state.AccessKeyView
+	AllowedCredentialIDs  map[uint]struct{}
+	PreferredCredentialID uint
+	AllowedCredentialRefs map[uint]state.CredentialRef
 
 	// ResponsesWebsocket 非 nil 时按原生 WS 合同准入，不要求 HTTP 资源接口。
 	ResponsesWebsocket *execution.WebsocketCapabilities
@@ -91,6 +95,7 @@ type normalizedQuery struct {
 	responsesStorePreference execution.ResponsesStorePreference
 	responsesWebsocket       *execution.WebsocketCapabilities
 	externalModel            *string
+	filterModel              *string
 	advisorModels            []string
 	accessKey                state.AccessKeyView
 	allowedCredentialIDs     map[uint]struct{}
@@ -448,6 +453,10 @@ func normalizeQuery(query Query) normalizedQuery {
 			operation = execution.OperationChatCompletion
 		}
 	}
+	filterModel := query.FilterModel
+	if filterModel == nil {
+		filterModel = query.ExternalModel
+	}
 	return normalizedQuery{
 		clientProtocol:           clientProtocol,
 		operation:                operation,
@@ -455,6 +464,7 @@ func normalizeQuery(query Query) normalizedQuery {
 		responsesStorePreference: query.ResponsesStorePreference,
 		responsesWebsocket:       cloneWebsocketCapabilities(query.ResponsesWebsocket),
 		externalModel:            cloneString(query.ExternalModel),
+		filterModel:              cloneString(filterModel),
 		advisorModels:            append([]string(nil), query.AdvisorModels...),
 		accessKey:                query.AccessKey,
 		allowedCredentialIDs:     cloneAllowedCredentialIDs(query),
