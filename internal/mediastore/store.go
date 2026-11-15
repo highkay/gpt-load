@@ -106,15 +106,35 @@ func (store *Store) Reserve(ctx context.Context, task media.Task) (media.Task, b
 			return existing, false, nil
 		}
 		if errors.Is(lookupErr, media.ErrNotFound) {
-			// The unique index can still hold an expired row. Remove it and retry
-			// once so an idempotency key remains reusable after its TTL elapses.
-			if deleteErr := store.db.WithContext(ctx).
-				Where("access_key_id = ? AND idempotency_key = ?", task.AccessKeyID, *task.IdempotencyKey).
-				Delete(&media.Task{}).Error; deleteErr == nil {
-				if createErr := store.db.WithContext(ctx).Create(&task).Error; createErr == nil {
-					return task, true, nil
+			// The unique index can still hold an expired row. Remove only a row
+			// that is still expired at delete time, then retry once. A concurrent
+			// request may have replaced the expired row in between; in that case
+			// the guarded delete affects no row and we return the winner.
+			now := store.currentTime().UnixMilli()
+			deleted := store.db.WithContext(ctx).
+				Where("access_key_id = ? AND idempotency_key = ? AND expires_at_ms <= ?", task.AccessKeyID, *task.IdempotencyKey, now).
+				Delete(&media.Task{})
+			if deleted.Error != nil {
+				return media.Task{}, false, deleted.Error
+			}
+			if deleted.RowsAffected == 0 {
+				existing, lookupErr = store.getByIdempotency(ctx, task.AccessKeyID, *task.IdempotencyKey)
+				if lookupErr == nil {
+					return existing, false, nil
+				}
+				return media.Task{}, false, err
+			}
+			createErr := store.db.WithContext(ctx).Create(&task).Error
+			if createErr == nil {
+				return task, true, nil
+			}
+			if isDuplicateError(createErr) {
+				existing, lookupErr = store.getByIdempotency(ctx, task.AccessKeyID, *task.IdempotencyKey)
+				if lookupErr == nil {
+					return existing, false, nil
 				}
 			}
+			return media.Task{}, false, createErr
 		}
 	}
 	return media.Task{}, false, err
@@ -162,18 +182,19 @@ func (store *Store) UpdateCreateResult(ctx context.Context, task media.Task) err
 	}
 	task.UpdatedAtMS = store.currentTime().UnixMilli()
 	return store.db.WithContext(ctx).Model(&media.Task{}).Where("id = ?", task.ID).Updates(map[string]any{
-		"group_id":            task.GroupID,
-		"credential_id":       task.CredentialID,
-		"upstream_task_id":    task.UpstreamTaskID,
-		"upstream_task_alias": task.UpstreamTaskAlias,
-		"upstream_video_id":   task.UpstreamVideoID,
-		"upstream_model":      task.UpstreamModel,
-		"status":              task.Status,
-		"progress":            task.Progress,
-		"result_url":          task.ResultURL,
-		"last_error_code":     task.LastErrorCode,
-		"last_error_message":  task.LastErrorMessage,
-		"updated_at_ms":       task.UpdatedAtMS,
+		"group_id":                       task.GroupID,
+		"credential_id":                  task.CredentialID,
+		"credential_identity_generation": task.CredentialIdentityGeneration,
+		"upstream_task_id":               task.UpstreamTaskID,
+		"upstream_task_alias":            task.UpstreamTaskAlias,
+		"upstream_video_id":              task.UpstreamVideoID,
+		"upstream_model":                 task.UpstreamModel,
+		"status":                         task.Status,
+		"progress":                       task.Progress,
+		"result_url":                     task.ResultURL,
+		"last_error_code":                task.LastErrorCode,
+		"last_error_message":             task.LastErrorMessage,
+		"updated_at_ms":                  task.UpdatedAtMS,
 	}).Error
 }
 
@@ -182,14 +203,19 @@ func (store *Store) UpdateObservation(ctx context.Context, task media.Task) erro
 		return fmt.Errorf("media task store is unavailable")
 	}
 	task.UpdatedAtMS = store.currentTime().UnixMilli()
-	return store.db.WithContext(ctx).Model(&media.Task{}).Where("id = ?", task.ID).Updates(map[string]any{
-		"status":             task.Status,
-		"progress":           task.Progress,
-		"result_url":         task.ResultURL,
-		"last_error_code":    task.LastErrorCode,
-		"last_error_message": task.LastErrorMessage,
-		"updated_at_ms":      task.UpdatedAtMS,
-	}).Error
+	// Terminal rows are written by the operation that reached the terminal
+	// state. A slower observation from an earlier GET must not overwrite them.
+	result := store.db.WithContext(ctx).Model(&media.Task{}).
+		Where("id = ? AND status NOT IN ?", task.ID, []string{media.StatusCompleted, media.StatusFailed, media.StatusCancelled}).
+		Updates(map[string]any{
+			"status":             task.Status,
+			"progress":           task.Progress,
+			"result_url":         task.ResultURL,
+			"last_error_code":    task.LastErrorCode,
+			"last_error_message": task.LastErrorMessage,
+			"updated_at_ms":      task.UpdatedAtMS,
+		})
+	return result.Error
 }
 
 func (store *Store) MarkFailed(ctx context.Context, id, code, message string) error {

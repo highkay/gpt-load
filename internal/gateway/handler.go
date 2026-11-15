@@ -752,12 +752,18 @@ func (handler *Handler) Handle(ginContext *gin.Context) {
 			return
 		}
 	}
+	filterModel := metadata.Model
+	if mediaState != nil && mediaState.binding.ID != "" {
+		boundModel := mediaState.binding.ClientModel
+		filterModel = &boundModel
+	}
 	query := scheduler.Query{
 		ClientProtocol:           selectedProtocol,
 		Operation:                metadata.Operation,
 		RouteRequirement:         metadata.RouteRequirement,
 		ResponsesStorePreference: metadata.ResponsesStorePreference,
 		ExternalModel:            metadata.Model,
+		FilterModel:              filterModel,
 		AdvisorModels:            metadata.AdvisorModels,
 		AccessKey:                accessKey,
 	}
@@ -1652,7 +1658,7 @@ func (handler *Handler) executeAttempts(
 		if mediaState != nil && mediaState.create != nil {
 			videoTransportFailure := !result.HasResponse() && result.Err != nil &&
 				ginContext.Request.Context().Err() == nil
-			if videoTransportFailure && forwardAttempts < forwardAttemptLimit {
+			if videoTransportFailure && forwardAttempts < forwardAttemptLimit && mediaCreateReplaySafe(result) {
 				decision.Retry = health.RetryNextCandidate
 				decision.Effect = health.EffectNone
 			}
@@ -1668,7 +1674,7 @@ func (handler *Handler) executeAttempts(
 					decision.Retry = health.RetryNextCandidate
 				}
 				if result.StatusCode >= http.StatusInternalServerError && result.StatusCode < 600 &&
-					forwardAttempts < forwardAttemptLimit && !videoHasTaskID {
+					forwardAttempts < forwardAttemptLimit && !videoHasTaskID && mediaCreateReplaySafe(result) {
 					decision.Retry = health.RetryNextCandidate
 					decision.Effect = health.EffectNone
 				}

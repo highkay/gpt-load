@@ -9,6 +9,7 @@ import (
 
 	"gpt-load/internal/channel"
 	"gpt-load/internal/execution"
+	"gpt-load/internal/media"
 	"gpt-load/internal/protocol"
 )
 
@@ -30,7 +31,7 @@ func prepareVideos(
 		failure  *execution.AttemptResult
 	)
 	if spec.Operation == execution.OperationVideosCreate {
-		body, headers, failure = videoCreateRequest(spec, headers)
+		body, headers, failure = videoCreateRequest(spec, headers, resolved)
 		if failure != nil {
 			return preparedAttempt{}, failure
 		}
@@ -60,6 +61,7 @@ func prepareVideos(
 func videoCreateRequest(
 	spec execution.AttemptSpec,
 	headers map[string]string,
+	resolved channel.ResolvedTarget,
 ) ([]byte, map[string]string, *execution.AttemptResult) {
 	body, sanitizedHeaders, err := sanitizeNativePassthroughRequest(spec, false)
 	if err != nil {
@@ -75,7 +77,22 @@ func videoCreateRequest(
 	if headers == nil {
 		headers = make(map[string]string, 2)
 	}
-	headers["Content-Type"] = "application/json"
+	contentType := headers["Content-Type"]
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	if resolved.ChannelID == channel.Agnes && strings.HasPrefix(strings.ToLower(contentType), "application/json") {
+		normalized, normalizeErr := media.NormalizeAgnesOpenAIVideoBody(body)
+		if normalizeErr != nil {
+			failure := notSentUnaryFailure(execution.ErrorKindInvalidRequest, "invalid video request body")
+			failure.Error.OriginHint = execution.ErrorOriginClient
+			failure.Error.ScopeHint = execution.ErrorScopeRequest
+			failure.Error.ReplaySafety = execution.ReplaySafetyUnknown
+			return nil, nil, &failure
+		}
+		body = normalized
+	}
+	headers["Content-Type"] = contentType
 	headers["Accept-Encoding"] = "identity"
 	return body, headers, nil
 }

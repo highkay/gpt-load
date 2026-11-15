@@ -49,6 +49,7 @@ type OpenAIVideoCreateRequest struct {
 	Videos      []OpenAIVideoReference
 
 	NormalizedBody []byte
+	ContentType    string
 }
 
 // UpstreamResponse is the provider-neutral view of one upstream video object.
@@ -98,7 +99,7 @@ func ParseOpenAIVideoCreateRequest(body []byte) (OpenAIVideoCreateRequest, error
 		return OpenAIVideoCreateRequest{}, &ValidationError{Param: "", Message: "Request body must contain exactly one JSON object."}
 	}
 
-	request := OpenAIVideoCreateRequest{N: 1, Mode: DefaultMode, Seconds: DefaultSeconds, Size: DefaultSize, AspectRatio: DefaultAspectRatio}
+	request := OpenAIVideoCreateRequest{}
 	model, present, err := stringField(raw, "model", true)
 	if err != nil {
 		return OpenAIVideoCreateRequest{}, err
@@ -123,46 +124,35 @@ func ParseOpenAIVideoCreateRequest(body []byte) (OpenAIVideoCreateRequest, error
 	if request.Mode, present, err = stringField(raw, "mode", false); err != nil {
 		return OpenAIVideoCreateRequest{}, err
 	}
-	if !present || request.Mode == "" {
-		request.Mode = DefaultMode
-	}
-	switch request.Mode {
-	case "text", "keyframe", "reference":
-	default:
-		return OpenAIVideoCreateRequest{}, &ValidationError{Param: "mode", Message: "mode must be one of text, keyframe, or reference."}
+	if present && request.Mode != "" {
+		switch request.Mode {
+		case "text", "keyframe", "reference":
+		default:
+			return OpenAIVideoCreateRequest{}, &ValidationError{Param: "mode", Message: "mode must be one of text, keyframe, or reference."}
+		}
 	}
 
 	if request.Seconds, present, err = stringField(raw, "seconds", false); err != nil {
 		return OpenAIVideoCreateRequest{}, err
 	}
-	if !present || request.Seconds == "" {
-		request.Seconds = DefaultSeconds
-	} else {
+	if present && request.Seconds != "" {
 		seconds, parseErr := strconv.Atoi(request.Seconds)
-		if parseErr != nil || seconds < 4 || seconds > 12 {
-			return OpenAIVideoCreateRequest{}, &ValidationError{Param: "seconds", Message: "seconds must be a string between \"4\" and \"12\"."}
+		if parseErr != nil || seconds < 1 || seconds > 60 {
+			return OpenAIVideoCreateRequest{}, &ValidationError{Param: "seconds", Message: "seconds must be a positive integer string."}
 		}
 	}
 
 	if request.Size, present, err = stringField(raw, "size", false); err != nil {
 		return OpenAIVideoCreateRequest{}, err
 	}
-	if !present || request.Size == "" {
-		request.Size = DefaultSize
-	}
-	switch request.Size {
-	case "720P", "1080P", "1K", "2K":
-	default:
-		return OpenAIVideoCreateRequest{}, &ValidationError{Param: "size", Message: "size must be one of 720P, 1080P, 1K, or 2K."}
+	if present && request.Size != "" && !validOpenAIVideoSize(request.Size) {
+		return OpenAIVideoCreateRequest{}, &ValidationError{Param: "size", Message: "size must be a WxH string or one of 720P, 1080P, 1K, or 2K."}
 	}
 
 	if request.AspectRatio, present, err = stringField(raw, "aspect_ratio", false); err != nil {
 		return OpenAIVideoCreateRequest{}, err
 	}
-	if !present || request.AspectRatio == "" {
-		request.AspectRatio = DefaultAspectRatio
-	}
-	if len(request.AspectRatio) > 16 || strings.ContainsAny(request.AspectRatio, "\r\n\x00") {
+	if request.AspectRatio != "" && (len(request.AspectRatio) > 16 || strings.ContainsAny(request.AspectRatio, "\r\n\x00")) {
 		return OpenAIVideoCreateRequest{}, &ValidationError{Param: "aspect_ratio", Message: "aspect_ratio is invalid."}
 	}
 
@@ -200,34 +190,36 @@ func ParseOpenAIVideoCreateRequest(body []byte) (OpenAIVideoCreateRequest, error
 		return OpenAIVideoCreateRequest{}, err
 	}
 
-	switch request.Mode {
-	case "text":
-		if len(request.Images) > 0 || len(request.Audios) > 0 || len(request.Videos) > 0 ||
-			request.FirstFrame != "" || request.LastFrame != "" {
-			return OpenAIVideoCreateRequest{}, &ValidationError{
-				Param: "mode", Message: "mode=text does not accept first_frame, last_frame, images, audios, or videos.",
+	if request.Mode != "" {
+		switch request.Mode {
+		case "text":
+			if len(request.Images) > 0 || len(request.Audios) > 0 || len(request.Videos) > 0 ||
+				request.FirstFrame != "" || request.LastFrame != "" {
+				return OpenAIVideoCreateRequest{}, &ValidationError{
+					Param: "mode", Message: "mode=text does not accept first_frame, last_frame, images, audios, or videos.",
+				}
 			}
-		}
-	case "keyframe":
-		if len(request.Images) > 0 || len(request.Audios) > 0 || len(request.Videos) > 0 {
-			return OpenAIVideoCreateRequest{}, &ValidationError{
-				Param: "mode", Message: "mode=keyframe does not accept images, audios, or videos.",
+		case "keyframe":
+			if len(request.Images) > 0 || len(request.Audios) > 0 || len(request.Videos) > 0 {
+				return OpenAIVideoCreateRequest{}, &ValidationError{
+					Param: "mode", Message: "mode=keyframe does not accept images, audios, or videos.",
+				}
 			}
-		}
-		if request.FirstFrame == "" && request.LastFrame == "" {
-			return OpenAIVideoCreateRequest{}, &ValidationError{
-				Param: "first_frame", Message: "mode=keyframe requires first_frame or last_frame.",
+			if request.FirstFrame == "" && request.LastFrame == "" {
+				return OpenAIVideoCreateRequest{}, &ValidationError{
+					Param: "first_frame", Message: "mode=keyframe requires first_frame or last_frame.",
+				}
 			}
-		}
-	case "reference":
-		if request.FirstFrame != "" || request.LastFrame != "" {
-			return OpenAIVideoCreateRequest{}, &ValidationError{
-				Param: "mode", Message: "mode=reference does not accept first_frame or last_frame.",
+		case "reference":
+			if request.FirstFrame != "" || request.LastFrame != "" {
+				return OpenAIVideoCreateRequest{}, &ValidationError{
+					Param: "mode", Message: "mode=reference does not accept first_frame or last_frame.",
+				}
 			}
-		}
-		if len(request.Images) == 0 && len(request.Audios) == 0 && len(request.Videos) == 0 {
-			return OpenAIVideoCreateRequest{}, &ValidationError{
-				Param: "images", Message: "mode=reference requires at least one of images, audios, or videos.",
+			if len(request.Images) == 0 && len(request.Audios) == 0 && len(request.Videos) == 0 {
+				return OpenAIVideoCreateRequest{}, &ValidationError{
+					Param: "images", Message: "mode=reference requires at least one of images, audios, or videos.",
+				}
 			}
 		}
 	}
@@ -237,7 +229,28 @@ func ParseOpenAIVideoCreateRequest(body []byte) (OpenAIVideoCreateRequest, error
 		return OpenAIVideoCreateRequest{}, err
 	}
 	request.NormalizedBody = normalized
+	request.ContentType = "application/json"
 	return request, nil
+}
+
+func validOpenAIVideoSize(value string) bool {
+	switch value {
+	case "720P", "1080P", "1K", "2K":
+		return true
+	}
+	parts := strings.Split(strings.ToLower(value), "x")
+	if len(parts) != 2 {
+		return false
+	}
+	width, err := strconv.Atoi(parts[0])
+	if err != nil || width <= 0 || width > 8192 {
+		return false
+	}
+	height, err := strconv.Atoi(parts[1])
+	if err != nil || height <= 0 || height > 8192 {
+		return false
+	}
+	return len(value) <= 32
 }
 
 func normalizeOpenAIVideoBody(raw map[string]json.RawMessage, request OpenAIVideoCreateRequest) ([]byte, error) {
@@ -252,34 +265,47 @@ func normalizeOpenAIVideoBody(raw map[string]json.RawMessage, request OpenAIVide
 		}
 		return encodedValue, nil
 	}
-	for key, value := range map[string]any{
-		"model":        request.Model,
-		"prompt":       request.Prompt,
-		"mode":         request.Mode,
-		"seconds":      request.Seconds,
-		"size":         request.Size,
-		"aspect_ratio": request.AspectRatio,
-		"n":            request.N,
-	} {
+	fields := map[string]any{
+		"model":  request.Model,
+		"prompt": request.Prompt,
+	}
+	if request.Mode != "" {
+		fields["mode"] = request.Mode
+	}
+	if request.Seconds != "" {
+		fields["seconds"] = request.Seconds
+	}
+	if request.Size != "" {
+		fields["size"] = request.Size
+	}
+	if request.AspectRatio != "" {
+		fields["aspect_ratio"] = request.AspectRatio
+	}
+	if request.N != 0 {
+		fields["n"] = request.N
+	}
+	for key, value := range fields {
 		valueJSON, err := encoded(value)
 		if err != nil {
 			return nil, err
 		}
 		object[key] = valueJSON
 	}
-	for _, key := range []string{"first_frame", "last_frame", "images", "audios", "videos"} {
-		if _, exists := object[key]; !exists {
-			continue
-		}
-		if (key == "first_frame" || key == "last_frame") && request.Mode == "reference" {
-			delete(object, key)
-			continue
-		}
-		if key == "images" || key == "audios" || key == "videos" {
-			if request.Mode != "reference" {
+	if request.Mode != "" {
+		for _, key := range []string{"first_frame", "last_frame", "images", "audios", "videos"} {
+			if _, exists := object[key]; !exists {
+				continue
+			}
+			if (key == "first_frame" || key == "last_frame") && request.Mode == "reference" {
 				delete(object, key)
-			} else if emptyRawArray(object[key]) {
-				delete(object, key)
+				continue
+			}
+			if key == "images" || key == "audios" || key == "videos" {
+				if request.Mode != "reference" {
+					delete(object, key)
+				} else if emptyRawArray(object[key]) {
+					delete(object, key)
+				}
 			}
 		}
 	}

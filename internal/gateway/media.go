@@ -159,6 +159,11 @@ func (handler *Handler) prepareMediaRequest(
 			return nil, metadata, parsed, &reasonMediaTaskNotFound
 		}
 	}
+	if len(accessKey.Filters.Groups) > 0 {
+		if _, allowed := accessKey.Filters.Groups[task.GroupID]; !allowed {
+			return nil, metadata, parsed, &reasonMediaTaskNotFound
+		}
+	}
 	if metadata.Operation == execution.OperationZhipuMediaCancel {
 		if recorder != nil {
 			recorder.setClientModel(task.ClientModel)
@@ -173,7 +178,8 @@ func (handler *Handler) prepareMediaRequest(
 		return nil, metadata, parsed, &reasonMediaCredentialUnavailable
 	}
 	ref, ok := handler.registry.CredentialRef(task.CredentialID)
-	if !ok || ref.GroupID != task.GroupID || !handler.mediaCredentialAvailable(task.GroupID, task.CredentialID) {
+	if !ok || !mediaCredentialBound(task, ref) ||
+		!handler.mediaCredentialAvailable(task.GroupID, task.CredentialID) {
 		return nil, metadata, parsed, &reasonMediaCredentialUnavailable
 	}
 	if task.UpstreamTaskID == "" {
@@ -227,6 +233,13 @@ func (handler *Handler) prepareMediaRequest(
 		parsed.Header.Del("Content-Length")
 	}
 	return state, metadata, parsed, nil
+}
+
+func mediaCredentialBound(task media.Task, ref state.CredentialRef) bool {
+	if ref.GroupID != task.GroupID {
+		return false
+	}
+	return task.CredentialIdentityGeneration == 0 || ref.IdentityGeneration == task.CredentialIdentityGeneration
 }
 
 func taskParams(create *media.MediaCreate, idPrefix string) media.NewTaskParams {
@@ -364,6 +377,7 @@ func (handler *Handler) finalizeMediaCreate(
 	}
 	task.GroupID = selection.GroupID
 	task.CredentialID = ref.ID
+	task.CredentialIdentityGeneration = ref.IdentityGeneration
 	task.Protocol = string(state.protocol)
 	task.Operation = string(state.operation)
 	task.Kind = state.kind
@@ -476,7 +490,11 @@ func (handler *Handler) finalizeMediaResource(
 	if err != nil {
 		return result, &reasonMediaInternal
 	}
-	if err := state.store.UpdateObservation(ctx, task); err != nil {
+	if state.delete {
+		if err := state.store.MarkCancelled(ctx, task.AccessKeyID, task.ID); err != nil {
+			return result, &reasonMediaInternal
+		}
+	} else if err := state.store.UpdateObservation(ctx, task); err != nil {
 		return result, &reasonMediaInternal
 	}
 	state.binding = task
@@ -568,6 +586,11 @@ func (handler *Handler) handleOpenAIVideoContent(
 	task media.Task,
 	recorder *requestRecorder,
 ) *reason {
+	release, admission := handler.acquireGroupConcurrency(group.ID)
+	if admission != nil {
+		return admission
+	}
+	defer release()
 	started := handler.now()
 	upstreamModel := task.UpstreamModel
 	selection := scheduler.Selection{
@@ -654,6 +677,23 @@ func (handler *Handler) handleOpenAIVideoContent(
 		handler.recordOpenAIVideoContentAttempt(recorder, group, ref, task, response.StatusCode, response.Header.Get("X-Request-Id"), started, &reasonMediaTaskNotFound)
 		return &reasonMediaTaskNotFound
 	}
+	if response.StatusCode == http.StatusNotModified ||
+		response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		copyVideoContentHeaders(ginContext.Writer.Header(), response.Header)
+		if response.StatusCode == http.StatusNotModified {
+			ginContext.Writer.Header().Del("Content-Length")
+		}
+		ginContext.Status(response.StatusCode)
+		ginContext.Writer.WriteHeaderNow()
+		if response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			_, _ = io.CopyBuffer(ginContext.Writer, response.Body, make([]byte, 32<<10))
+		}
+		if flusher, ok := ginContext.Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		handler.recordOpenAIVideoContentAttempt(recorder, group, ref, task, response.StatusCode, response.Header.Get("X-Request-Id"), started, nil)
+		return nil
+	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, maxVideoErrorBodyBytes))
 		message := videoUpstreamErrorMessage(body)
@@ -669,11 +709,20 @@ func (handler *Handler) handleOpenAIVideoContent(
 	copyVideoContentHeaders(ginContext.Writer.Header(), response.Header)
 	ginContext.Status(response.StatusCode)
 	ginContext.Writer.WriteHeaderNow()
+	if flusher, ok := ginContext.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
 	buffer := make([]byte, 64<<10)
 	if _, err := io.CopyBuffer(ginContext.Writer, response.Body, buffer); err != nil {
 		utilsLogMedia(handler.logger, logrus.WarnLevel, map[string]any{
 			"event": "video_content_stream_failed", "video_task_id": task.ID, "error": err.Error(),
 		}, "Video content stream ended early")
+		value := reasonUpstreamConnect
+		if isTimeoutError(err) {
+			value = reasonUpstreamTimeout
+		}
+		handler.recordOpenAIVideoContentAttempt(recorder, group, ref, task, response.StatusCode, response.Header.Get("X-Request-Id"), started, &value)
+		panic(http.ErrAbortHandler)
 	}
 	if flusher, ok := ginContext.Writer.(http.Flusher); ok {
 		flusher.Flush()
@@ -815,29 +864,42 @@ func newMediaHTTPClient(
 	if timeouts.FirstByte > 0 {
 		transport.ResponseHeaderTimeout = timeouts.FirstByte
 	}
+	var safeDial func(context.Context, string, string) (net.Conn, error)
 	switch normalized.Config.Mode {
 	case outboundproxy.ModeDirect:
 		transport.Proxy = nil
+		if blockPrivate {
+			safeDial = dialer.DialContext
+		}
 	case outboundproxy.ModeEnvironment:
-		transport.Proxy = http.ProxyFromEnvironment
+		transport.Proxy = validatedMediaProxy(http.ProxyFromEnvironment, blockPrivate)
 	case outboundproxy.ModeCustom:
 		proxyURL, parseErr := url.Parse(normalized.Config.URL)
 		if parseErr != nil || proxyURL.Hostname() == "" {
 			return nil, fmt.Errorf("invalid video proxy endpoint")
 		}
 		if proxyURL.Scheme == "socks5" {
-			dialer, dialErr := proxy.FromURL(proxyURL, &net.Dialer{Timeout: 15 * time.Second})
-			contextDialer, ok := dialer.(proxy.ContextDialer)
+			socksDialer, dialErr := proxy.FromURL(proxyURL, &net.Dialer{Timeout: 15 * time.Second})
+			contextDialer, ok := socksDialer.(proxy.ContextDialer)
 			if dialErr != nil || !ok {
 				return nil, fmt.Errorf("invalid video socks proxy")
 			}
-			transport.DialContext = contextDialer.DialContext
+			if blockPrivate {
+				safeDial = contextDialer.DialContext
+			} else {
+				transport.DialContext = contextDialer.DialContext
+			}
 			transport.Proxy = nil
 		} else {
-			transport.Proxy = http.ProxyURL(proxyURL)
+			transport.Proxy = validatedMediaProxy(func(*http.Request) (*url.URL, error) {
+				return proxyURL, nil
+			}, blockPrivate)
 		}
 	default:
 		return nil, fmt.Errorf("invalid video proxy mode")
+	}
+	if safeDial != nil {
+		transport.DialContext = mediaSafeDialer{dial: safeDial}.DialContext
 	}
 	timeout := timeouts.Request
 	if timeout <= 0 {
@@ -861,6 +923,60 @@ func newMediaHTTPClient(
 			return nil
 		},
 	}, nil
+}
+
+func validatedMediaProxy(base func(*http.Request) (*url.URL, error), blockPrivate bool) func(*http.Request) (*url.URL, error) {
+	if !blockPrivate || base == nil {
+		return base
+	}
+	return func(request *http.Request) (*url.URL, error) {
+		if err := validatePublicVideoURL(request.Context(), request.URL.String()); err != nil {
+			return nil, err
+		}
+		return base(request)
+	}
+}
+
+type mediaSafeDialer struct {
+	dial     func(ctx context.Context, network, address string) (net.Conn, error)
+	resolver *net.Resolver
+}
+
+func (d mediaSafeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if blockedVideoIP(ip) {
+			return nil, errors.New("media address is not public")
+		}
+		return d.dial(ctx, network, address)
+	}
+	resolver := d.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	addresses, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil || len(addresses) == 0 {
+		return nil, errors.New("media address could not be resolved")
+	}
+	var lastErr error
+	for _, resolved := range addresses {
+		if blockedVideoIP(resolved.IP) {
+			lastErr = errors.New("media address is not public")
+			continue
+		}
+		conn, dialErr := d.dial(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	if lastErr == nil {
+		lastErr = errors.New("media address is not public")
+	}
+	return nil, lastErr
 }
 
 func validatePublicVideoURL(ctx context.Context, rawURL string) error {
@@ -983,7 +1099,7 @@ func agnesVideoRetrieveURL(group state.GroupView, task media.Task) (string, erro
 	}
 	path := strings.TrimRight(parsed.Path, "/")
 	path = strings.TrimSuffix(path, "/v1")
-	parsed.Path = path
+	parsed.Path = strings.TrimRight(path, "/") + "/agnesapi"
 	parsed.RawPath = ""
 	query := url.Values{}
 	query.Set("video_id", task.UpstreamTaskID)
@@ -1076,6 +1192,14 @@ func mediaPhase(operation execution.Operation) string {
 	default:
 		return ""
 	}
+}
+
+func mediaCreateReplaySafe(result UpstreamResult) bool {
+	if result.DispatchState == execution.DispatchNotSent {
+		return true
+	}
+	return result.ExecutionError != nil &&
+		result.ExecutionError.ReplaySafety == execution.ReplaySafetyRejectedBeforeProcessing
 }
 
 func (handler *Handler) mediaResultHasTaskID(selectedProtocol protocol.Protocol, selection scheduler.Selection, result UpstreamResult) bool {

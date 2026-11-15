@@ -37,6 +37,7 @@ type TaskStore interface {
 	UpdateCreateResult(ctx context.Context, task Task) error
 	UpdateObservation(ctx context.Context, task Task) error
 	MarkFailed(ctx context.Context, id, code, message string) error
+	MarkCancelled(ctx context.Context, accessKeyID uint, id string) error
 }
 
 // ValidationError identifies one invalid request field and is safe to return
@@ -95,36 +96,37 @@ type NewTaskParams struct {
 // task plus the credential that created it. It intentionally stores no
 // credential material.
 type Task struct {
-	ID                string  `gorm:"type:varchar(40);primaryKey;not null"`
-	AccessKeyID       uint    `gorm:"not null;default:0;uniqueIndex:idx_media_tasks_idempotency,priority:1"`
-	GroupID           uint    `gorm:"not null;default:0"`
-	CredentialID      uint    `gorm:"not null;default:0"`
-	Protocol          string  `gorm:"type:varchar(32);not null;default:'openai-videos'"`
-	Operation         string  `gorm:"type:varchar(48);not null;default:'videos_create'"`
-	Kind              string  `gorm:"type:varchar(16);not null;default:'video';check:chk_media_tasks_kind,kind IN ('image','video')"`
-	UpstreamTaskID    string  `gorm:"type:varchar(255);not null;default:''"`
-	UpstreamTaskAlias string  `gorm:"type:varchar(255);not null;default:''"`
-	UpstreamVideoID   string  `gorm:"type:varchar(255);not null;default:''"`
-	UpstreamModel     string  `gorm:"type:varchar(255);not null;default:''"`
-	ClientModel       string  `gorm:"type:varchar(255);not null;default:''"`
-	Status            string  `gorm:"type:varchar(32);not null;default:'queued';check:chk_media_tasks_status,status IN ('queued','in_progress','completed','failed','cancelled')"`
-	Mode              string  `gorm:"type:varchar(32);not null;default:''"`
-	Seconds           string  `gorm:"type:varchar(8);not null;default:''"`
-	Size              string  `gorm:"type:varchar(32);not null;default:''"`
-	AspectRatio       string  `gorm:"type:varchar(16);not null;default:''"`
-	Quality           string  `gorm:"type:varchar(16);not null;default:''"`
-	FPS               int     `gorm:"not null;default:0"`
-	Duration          int     `gorm:"not null;default:0"`
-	WithAudio         bool    `gorm:"not null;default:false"`
-	ImageCount        int     `gorm:"not null;default:0"`
-	ResultURL         string  `gorm:"type:text;not null;default:''"`
-	LastErrorCode     string  `gorm:"type:varchar(64);not null;default:''"`
-	LastErrorMessage  string  `gorm:"type:text;not null;default:''"`
-	IdempotencyKey    *string `gorm:"type:varchar(64);uniqueIndex:idx_media_tasks_idempotency,priority:2"`
-	Progress          int     `gorm:"not null;default:0;check:chk_media_tasks_progress,progress >= 0 AND progress <= 100"`
-	CreatedAtMS       int64   `gorm:"column:created_at_ms;not null;default:0"`
-	UpdatedAtMS       int64   `gorm:"column:updated_at_ms;not null;default:0"`
-	ExpiresAtMS       int64   `gorm:"column:expires_at_ms;not null;default:0;index:idx_media_tasks_expires"`
+	ID                           string  `gorm:"type:varchar(40);primaryKey;not null"`
+	AccessKeyID                  uint    `gorm:"not null;default:0;uniqueIndex:idx_media_tasks_idempotency,priority:1"`
+	GroupID                      uint    `gorm:"not null;default:0"`
+	CredentialID                 uint    `gorm:"not null;default:0"`
+	CredentialIdentityGeneration uint64  `gorm:"column:credential_identity_generation;not null;default:0"`
+	Protocol                     string  `gorm:"type:varchar(32);not null;default:'openai-videos'"`
+	Operation                    string  `gorm:"type:varchar(48);not null;default:'videos_create'"`
+	Kind                         string  `gorm:"type:varchar(16);not null;default:'video';check:chk_media_tasks_kind,kind IN ('image','video')"`
+	UpstreamTaskID               string  `gorm:"type:varchar(255);not null;default:''"`
+	UpstreamTaskAlias            string  `gorm:"type:varchar(255);not null;default:''"`
+	UpstreamVideoID              string  `gorm:"type:varchar(255);not null;default:''"`
+	UpstreamModel                string  `gorm:"type:varchar(255);not null;default:''"`
+	ClientModel                  string  `gorm:"type:varchar(255);not null;default:''"`
+	Status                       string  `gorm:"type:varchar(32);not null;default:'queued';check:chk_media_tasks_status,status IN ('queued','in_progress','completed','failed','cancelled')"`
+	Mode                         string  `gorm:"type:varchar(32);not null;default:''"`
+	Seconds                      string  `gorm:"type:varchar(8);not null;default:''"`
+	Size                         string  `gorm:"type:varchar(32);not null;default:''"`
+	AspectRatio                  string  `gorm:"type:varchar(16);not null;default:''"`
+	Quality                      string  `gorm:"type:varchar(16);not null;default:''"`
+	FPS                          int     `gorm:"not null;default:0"`
+	Duration                     int     `gorm:"not null;default:0"`
+	WithAudio                    bool    `gorm:"not null;default:false"`
+	ImageCount                   int     `gorm:"not null;default:0"`
+	ResultURL                    string  `gorm:"type:text;not null;default:''"`
+	LastErrorCode                string  `gorm:"type:varchar(64);not null;default:''"`
+	LastErrorMessage             string  `gorm:"type:text;not null;default:''"`
+	IdempotencyKey               *string `gorm:"type:varchar(64);uniqueIndex:idx_media_tasks_idempotency,priority:2"`
+	Progress                     int     `gorm:"not null;default:0;check:chk_media_tasks_progress,progress >= 0 AND progress <= 100"`
+	CreatedAtMS                  int64   `gorm:"column:created_at_ms;not null;default:0"`
+	UpdatedAtMS                  int64   `gorm:"column:updated_at_ms;not null;default:0"`
+	ExpiresAtMS                  int64   `gorm:"column:expires_at_ms;not null;default:0;index:idx_media_tasks_expires"`
 }
 
 func (Task) TableName() string { return "media_tasks" }

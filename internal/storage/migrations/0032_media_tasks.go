@@ -102,6 +102,11 @@ func Validate0032(db *gorm.DB) error {
 	}
 	found := make(map[string]bool)
 	for _, column := range columns {
+		// Added by 0034; the 0032 model intentionally predates it.
+		if column.Name() == "credential_identity_generation" {
+			found[column.Name()] = true
+			continue
+		}
 		field := statement.Schema.LookUpField(column.Name())
 		if field == nil {
 			return fmt.Errorf("media tasks contains unexpected column %q", column.Name())

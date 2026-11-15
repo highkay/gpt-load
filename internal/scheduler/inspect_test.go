@@ -133,6 +133,37 @@ func TestInspectRequiresModelWhenAccessKeyHasModelFilter(t *testing.T) {
 	}
 }
 
+func TestInspectUsesFilterModelForPinnedResources(t *testing.T) {
+	t.Parallel()
+	base := Query{
+		ClientProtocol: protocol.OpenAIVideos, Operation: execution.OperationVideosRetrieve,
+		ExternalModel: nil,
+		AccessKey: state.AccessKeyView{
+			Status:  state.AccessKeyStatusActive,
+			Filters: state.FilterSet{Models: map[string]struct{}{"video-model": {}}},
+		},
+	}
+	allowed := base
+	allowed.FilterModel = modelPointer("video-model")
+	got, err := Inspect(inspectSnapshot(t), nil, allowed, inspectNow())
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if got.Reason == ReasonModelRequiredByFilter || got.Reason == ReasonModelFiltered {
+		t.Fatalf("pinned filter model was not used: %#v", got)
+	}
+
+	denied := base
+	denied.FilterModel = modelPointer("other")
+	got, err = Inspect(inspectSnapshot(t), nil, denied, inspectNow())
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if got.Reason != ReasonModelFiltered {
+		t.Fatalf("Inspection = %#v, want reason %q", got, ReasonModelFiltered)
+	}
+}
+
 func TestInspectExplainsGroupsAndKeysInStableOrder(t *testing.T) {
 	now := inspectNow()
 	snapshot := inspectSnapshot(t)
